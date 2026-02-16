@@ -36,6 +36,7 @@ use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 use std::time::Instant;
+use tokio::sync::mpsc;
 
 use crate::bottom_pane::StatusLineItem;
 use crate::bottom_pane::StatusLineSetupView;
@@ -621,6 +622,9 @@ pub(crate) struct ChatWidget {
     // True once we've attempted a branch lookup for the current CWD.
     status_line_branch_lookup_complete: bool,
     external_editor_state: ExternalEditorState,
+    // WebSocket streaming channel for external integration
+    // Allows streaming Codex output to external applications via WebSocket
+    stream_tx: Option<tokio::sync::mpsc::UnboundedSender<String>>,
 }
 
 /// Snapshot of active-cell state that affects transcript overlay rendering.
@@ -2265,6 +2269,11 @@ impl ChatWidget {
 
     #[inline]
     fn handle_streaming_delta(&mut self, delta: String) {
+        // Send to WebSocket stream if enabled
+        if let Some(ref tx) = self.stream_tx {
+            let _ = tx.send(delta.clone());
+        }
+
         // Before streaming agent content, flush any active exec cell group.
         self.flush_unified_exec_wait_streak();
         self.flush_active_cell();
@@ -2299,6 +2308,83 @@ impl ChatWidget {
             self.run_catch_up_commit_tick();
         }
         self.request_redraw();
+    }
+
+    /// Enable WebSocket streaming for external integration.
+    ///
+    /// Starts a WebSocket server on the specified address and streams all Codex
+    /// output to connected clients in real-time.
+    ///
+    /// # Arguments
+    ///
+    /// * `bind_addr` - WebSocket server bind address (e.g., "127.0.0.1:8765")
+    ///
+    /// # Returns
+    ///
+    /// `Ok(())` if the server was started successfully, `Err` otherwise
+    pub fn enable_websocket_streaming(&mut self, bind_addr: String) -> Result<(), Box<dyn std::error::Error>> {
+        let (tx, mut rx) = mpsc::unbounded_channel::<String>();
+        self.stream_tx = Some(tx);
+
+        // Spawn WebSocket server task
+        tokio::spawn(async move {
+            use tokio::net::TcpListener;
+            use tokio_tungstenite::tungstenite::Message;
+            use futures_util::SinkExt;
+
+            let listener = match TcpListener::bind(&bind_addr).await {
+                Ok(l) => l,
+                Err(e) => {
+                    eprintln!("Failed to bind WebSocket server to {bind_addr}: {e}");
+                    return;
+                }
+            };
+
+            eprintln!("WebSocket streaming server listening on ws://{bind_addr}");
+            eprintln!("Connect with: websocat ws://{bind_addr} or Python websockets client");
+
+            let mut clients: Vec<tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>> = Vec::new();
+
+            // Accept connections in a loop
+            loop {
+                match listener.accept().await {
+                    Ok((stream, addr)) => {
+                        match tokio_tungstenite::accept_async(stream).await {
+                            Ok(ws) => {
+                                eprintln!("WebSocket client connected from {:?}", addr);
+                                clients.push(ws);
+                            }
+                            Err(e) => {
+                                eprintln!("WebSocket handshake failed: {e}");
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("WebSocket accept error: {e}");
+                    }
+                }
+
+                // Process any pending messages from the channel
+                if let Ok(text) = rx.try_recv() {
+                    // Send to all connected clients
+                    let mut disconnected = Vec::new();
+                    for (i, client) in clients.iter_mut().enumerate() {
+                        if let Err(_) = client.send(Message::Text(text.clone().into())).await {
+                            disconnected.push(i);
+                        }
+                    }
+
+                    // Remove disconnected clients
+                    for i in disconnected.into_iter().rev() {
+                        clients.remove(i);
+                    }
+                }
+
+                tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+            }
+        });
+
+        Ok(())
     }
 
     fn worked_elapsed_from(&mut self, current_elapsed: u64) -> u64 {
@@ -2686,6 +2772,7 @@ impl ChatWidget {
             status_line_branch_pending: false,
             status_line_branch_lookup_complete: false,
             external_editor_state: ExternalEditorState::Closed,
+            stream_tx: None,
         };
 
         widget.prefetch_rate_limits();
@@ -2853,6 +2940,7 @@ impl ChatWidget {
             status_line_branch_pending: false,
             status_line_branch_lookup_complete: false,
             external_editor_state: ExternalEditorState::Closed,
+            stream_tx: None,
         };
 
         widget.prefetch_rate_limits();
@@ -3009,6 +3097,7 @@ impl ChatWidget {
             status_line_branch_pending: false,
             status_line_branch_lookup_complete: false,
             external_editor_state: ExternalEditorState::Closed,
+            stream_tx: None,
         };
 
         widget.prefetch_rate_limits();

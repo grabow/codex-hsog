@@ -1,0 +1,5 @@
+# Codex WebSocket Client Requirements
+# Install with: pip install -r requirements.txt
+# Or with uv: uv pip install -r requirements.txt
+
+websockets>=12.0

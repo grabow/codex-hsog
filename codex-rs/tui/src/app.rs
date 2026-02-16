@@ -1395,6 +1395,8 @@ impl App {
                     otel_manager: self.otel_manager.clone(),
                 };
                 self.chat_widget = ChatWidget::new(init, self.server.clone());
+                // Enable WebSocket streaming for real-time output
+                let _ = self.chat_widget.enable_websocket_streaming("127.0.0.1:8765".to_string());
                 self.reset_thread_event_state();
                 if let Some(summary) = summary {
                     let mut lines: Vec<Line<'static>> = vec![summary.usage_line.clone().into()];
