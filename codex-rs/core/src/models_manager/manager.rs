@@ -470,6 +470,8 @@ mod tests {
             stream_idle_timeout_ms: Some(5_000),
             requires_openai_auth: false,
             supports_websockets: false,
+        fallback_chat: false,
+        fallback_chat_path: None,
         }
     }
 

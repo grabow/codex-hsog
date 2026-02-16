@@ -54,6 +54,8 @@ use codex_api::SseTelemetry;
 use codex_api::TransportError;
 use codex_api::WebsocketTelemetry;
 use codex_api::build_conversation_headers;
+use codex_api::ChatCompletionsClient;
+use codex_api::ChatCompletionsOptions;
 use codex_api::common::Reasoning;
 use codex_api::common::ResponsesWsRequest;
 use codex_api::create_text_param_for_request;
@@ -716,6 +718,9 @@ impl ModelClientSession {
     ///
     /// Handles SSE fixtures, reasoning summaries, verbosity, and the
     /// `text` controls used for output schemas.
+    ///
+    /// When the Responses API returns a 404 error and the provider is configured
+    /// with `fallback_chat = true`, automatically falls back to the Chat Completions API.
     #[allow(clippy::too_many_arguments)]
     async fn stream_responses_api(
         &self,
@@ -764,6 +769,111 @@ impl ModelClientSession {
             let stream_result = client.stream_request(request, options).await;
 
             match stream_result {
+                Ok(stream) => {
+                    let (stream, _) = map_response_stream(stream, otel_manager.clone());
+                    return Ok(stream);
+                }
+                Err(ApiError::Transport(
+                    unauthorized_transport @ TransportError::Http { status, .. },
+                )) if status == StatusCode::UNAUTHORIZED => {
+                    handle_unauthorized(unauthorized_transport, &mut auth_recovery).await?;
+                    continue;
+                }
+                Err(ApiError::Transport(TransportError::Http { status, .. }))
+                    if status == StatusCode::NOT_FOUND
+                        && self.client.state.provider.fallback_chat =>
+                {
+                    // Responses API returned 404, fall back to Chat Completions
+                    warn!(
+                        "Responses API returned 404, falling back to Chat Completions API for provider: {}",
+                        self.client.state.provider.name
+                    );
+                    otel_manager.counter(
+                        "codex.transport.fallback_to_chat",
+                        1,
+                        &[("provider", &self.client.state.provider.name)],
+                    );
+                    return self
+                        .stream_chat_completions_fallback(
+                            prompt,
+                            model_info,
+                            otel_manager,
+                            turn_metadata_header,
+                        )
+                        .await;
+                }
+                Err(err) => return Err(map_api_error(err)),
+            }
+        }
+    }
+
+    /// Streams a request via the Chat Completions API as a fallback.
+    ///
+    /// This function is called when the Responses API returns a 404 error
+    /// and the provider is configured with `fallback_chat = true`.
+    #[allow(clippy::too_many_arguments)]
+    async fn stream_chat_completions_fallback(
+        &self,
+        prompt: &Prompt,
+        model_info: &ModelInfo,
+        otel_manager: &OtelManager,
+        turn_metadata_header: Option<&str>,
+    ) -> Result<ResponseStream> {
+        let auth_manager = self.client.state.auth_manager.clone();
+        let mut auth_recovery = auth_manager
+            .as_ref()
+            .map(super::auth::AuthManager::unauthorized_recovery);
+
+        loop {
+            let client_setup = self.client.current_client_setup().await?;
+            let transport = ReqwestTransport::new(build_reqwest_client());
+            let (request_telemetry, sse_telemetry) = Self::build_streaming_telemetry(otel_manager);
+
+            // Build the Responses API request first (for translation)
+            let responses_request = self.build_responses_request(
+                &client_setup.api_provider,
+                prompt,
+                model_info,
+                None, // No reasoning support in Chat API
+                ReasoningSummaryConfig::None,
+            )?;
+
+            // Translate to Chat Completions format
+            let chat_request = codex_api::responses_to_chat_request(&responses_request);
+
+            // Build chat completions options
+            let turn_metadata_header = parse_turn_metadata_header(turn_metadata_header);
+            let conversation_id = self.client.state.conversation_id.to_string();
+            let mut extra_headers = build_responses_headers(
+                self.client.state.beta_features_header.as_deref(),
+                Some(&self.turn_state),
+                turn_metadata_header.as_ref(),
+            );
+            extra_headers.extend(build_conversation_headers(Some(conversation_id.clone())));
+
+            let options = ChatCompletionsOptions {
+                conversation_id: Some(conversation_id),
+                session_source: Some(self.client.state.session_source.clone()),
+                extra_headers,
+                turn_state: Some(Arc::clone(&self.turn_state)),
+            };
+
+            // Create the Chat Completions client with custom path if configured
+            let chat_path = self
+                .client
+                .state
+                .provider
+                .fallback_chat_path
+                .clone();
+            let client = ChatCompletionsClient::new(
+                transport,
+                client_setup.api_provider,
+                client_setup.api_auth,
+                chat_path,
+            )
+            .with_telemetry(Some(request_telemetry), Some(sse_telemetry));
+
+            match client.stream_request(chat_request, options).await {
                 Ok(stream) => {
                     let (stream, _) = map_response_stream(stream, otel_manager.clone());
                     return Ok(stream);

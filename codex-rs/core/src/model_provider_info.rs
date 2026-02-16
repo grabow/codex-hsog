@@ -111,6 +111,16 @@ pub struct ModelProviderInfo {
     /// Whether this provider supports the Responses API WebSocket transport.
     #[serde(default)]
     pub supports_websockets: bool,
+
+    /// Whether to fall back to the legacy Chat Completions API (`/v1/chat/completions`)
+    /// when the Responses API returns a 404 error.
+    #[serde(default)]
+    pub fallback_chat: bool,
+
+    /// Custom path for the Chat Completions fallback endpoint.
+    /// Defaults to "/v1/chat/completions" if not specified.
+    #[serde(default)]
+    pub fallback_chat_path: Option<String>,
 }
 
 impl ModelProviderInfo {
@@ -253,6 +263,8 @@ impl ModelProviderInfo {
             stream_idle_timeout_ms: None,
             requires_openai_auth: true,
             supports_websockets: true,
+            fallback_chat: false,
+            fallback_chat_path: None,
         }
     }
 
@@ -326,6 +338,8 @@ pub fn create_oss_provider_with_base_url(base_url: &str, wire_api: WireApi) -> M
         stream_idle_timeout_ms: None,
         requires_openai_auth: false,
         supports_websockets: false,
+        fallback_chat: false,
+        fallback_chat_path: None,
     }
 }
 
@@ -355,6 +369,8 @@ base_url = "http://localhost:11434/v1"
             stream_idle_timeout_ms: None,
             requires_openai_auth: false,
             supports_websockets: false,
+            fallback_chat: false,
+            fallback_chat_path: None,
         };
 
         let provider: ModelProviderInfo = toml::from_str(azure_provider_toml).unwrap();
@@ -386,6 +402,8 @@ query_params = { api-version = "2025-04-01-preview" }
             stream_idle_timeout_ms: None,
             requires_openai_auth: false,
             supports_websockets: false,
+            fallback_chat: false,
+            fallback_chat_path: None,
         };
 
         let provider: ModelProviderInfo = toml::from_str(azure_provider_toml).unwrap();
@@ -420,6 +438,8 @@ env_http_headers = { "X-Example-Env-Header" = "EXAMPLE_ENV_VAR" }
             stream_idle_timeout_ms: None,
             requires_openai_auth: false,
             supports_websockets: false,
+            fallback_chat: false,
+            fallback_chat_path: None,
         };
 
         let provider: ModelProviderInfo = toml::from_str(azure_provider_toml).unwrap();
