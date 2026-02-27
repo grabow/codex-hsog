@@ -25,7 +25,6 @@
 //! the final answer. During streaming we hide the status row to avoid duplicate
 //! progress indicators; once commentary completes and stream queues drain, we
 //! re-show it so users still see turn-in-progress state between output bursts.
-use serde::Deserialize;
 use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::collections::HashSet;
@@ -37,7 +36,6 @@ use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 use std::time::Instant;
-use tokio::sync::mpsc;
 
 use crate::bottom_pane::StatusLineItem;
 use crate::bottom_pane::StatusLineSetupView;
@@ -152,7 +150,6 @@ use ratatui::widgets::Wrap;
 use tokio::sync::mpsc::UnboundedSender;
 use tokio::task::JoinHandle;
 use tracing::debug;
-use tracing::info;
 use tracing::warn;
 
 const DEFAULT_MODEL_DISPLAY_NAME: &str = "loading";
@@ -161,60 +158,6 @@ const PLAN_IMPLEMENTATION_YES: &str = "Yes, implement this plan";
 const PLAN_IMPLEMENTATION_NO: &str = "No, stay in Plan mode";
 const PLAN_IMPLEMENTATION_CODING_MESSAGE: &str = "Implement the plan.";
 const CONNECTORS_SELECTION_VIEW_ID: &str = "connectors-selection";
-
-#[derive(Debug, Deserialize)]
-struct WebSocketInboundPayload {
-    #[serde(default)]
-    text: Option<String>,
-    #[serde(default)]
-    prompt: Option<String>,
-    #[serde(default)]
-    command: Option<String>,
-    #[serde(default)]
-    r#type: Option<String>,
-}
-
-#[derive(Debug, PartialEq, Eq)]
-enum WebSocketInboundCommand {
-    Submit(String),
-    Interrupt,
-}
-
-fn parse_websocket_inbound_command(raw: &str) -> Option<WebSocketInboundCommand> {
-    let trimmed = raw.trim();
-    if trimmed.is_empty() {
-        return None;
-    }
-
-    if matches!(trimmed, "/interrupt" | "/stop" | "/cancel") {
-        return Some(WebSocketInboundCommand::Interrupt);
-    }
-
-    if let Ok(payload) = serde_json::from_str::<WebSocketInboundPayload>(trimmed) {
-        let command = payload
-            .command
-            .or(payload.r#type)
-            .map(|value| value.trim().to_ascii_lowercase());
-
-        if command
-            .as_deref()
-            .is_some_and(|value| matches!(value, "interrupt" | "stop" | "cancel"))
-        {
-            return Some(WebSocketInboundCommand::Interrupt);
-        }
-
-        if let Some(text) = payload
-            .text
-            .or(payload.prompt)
-            .map(|value| value.trim().to_string())
-            .filter(|value| !value.is_empty())
-        {
-            return Some(WebSocketInboundCommand::Submit(text));
-        }
-    }
-
-    Some(WebSocketInboundCommand::Submit(trimmed.to_string()))
-}
 
 use crate::app_event::AppEvent;
 use crate::app_event::ConnectorsSnapshot;
@@ -679,9 +622,6 @@ pub(crate) struct ChatWidget {
     // True once we've attempted a branch lookup for the current CWD.
     status_line_branch_lookup_complete: bool,
     external_editor_state: ExternalEditorState,
-    // WebSocket streaming channel for external integration
-    // Allows streaming Codex output to external applications via WebSocket
-    stream_tx: Option<tokio::sync::mpsc::UnboundedSender<String>>,
     // Number of legacy `AgentMessage` events to suppress after we already mirrored the same
     // completed agent item through the ItemCompleted path.
     pending_legacy_agent_message_skips: usize,
@@ -2346,11 +2286,6 @@ impl ChatWidget {
 
     #[inline]
     fn handle_streaming_delta(&mut self, delta: String) {
-        // Send to WebSocket stream if enabled
-        if let Some(ref tx) = self.stream_tx {
-            let _ = tx.send(delta.clone());
-        }
-
         // Before streaming agent content, flush any active exec cell group.
         self.flush_unified_exec_wait_streak();
         self.flush_active_cell();
@@ -2385,136 +2320,6 @@ impl ChatWidget {
             self.run_catch_up_commit_tick();
         }
         self.request_redraw();
-    }
-
-    /// Enable WebSocket streaming for external integration.
-    ///
-    /// Starts a WebSocket server on the specified address and streams all Codex
-    /// output to connected clients in real-time.
-    ///
-    /// # Arguments
-    ///
-    /// * `bind_addr` - WebSocket server bind address (e.g., "127.0.0.1:8765")
-    ///
-    /// # Returns
-    ///
-    /// `Ok(())` if the server was started successfully, `Err` otherwise
-    pub fn enable_websocket_streaming(
-        &mut self,
-        bind_addr: String,
-    ) -> Result<(), Box<dyn std::error::Error>> {
-        let (tx, mut rx) = mpsc::unbounded_channel::<String>();
-        self.stream_tx = Some(tx);
-        let app_event_tx = self.app_event_tx.clone();
-
-        // Spawn WebSocket server task
-        tokio::spawn(async move {
-            use futures_util::SinkExt;
-            use futures_util::StreamExt;
-            use tokio::net::TcpListener;
-            use tokio::sync::broadcast;
-            use tokio_tungstenite::tungstenite::Message;
-
-            let listener = match TcpListener::bind(&bind_addr).await {
-                Ok(l) => l,
-                Err(e) => {
-                    warn!("failed to bind websocket server to {bind_addr}: {e}");
-                    return;
-                }
-            };
-
-            info!("websocket streaming server listening on ws://{bind_addr}");
-            let (broadcast_tx, _) = broadcast::channel::<String>(256);
-
-            loop {
-                tokio::select! {
-                    maybe_text = rx.recv() => {
-                        let Some(text) = maybe_text else {
-                            break;
-                        };
-                        let _ = broadcast_tx.send(text);
-                    }
-                    accept_result = listener.accept() => {
-                        match accept_result {
-                            Ok((stream, addr)) => {
-                                let app_event_tx = app_event_tx.clone();
-                                let mut outbound_rx = broadcast_tx.subscribe();
-                                tokio::spawn(async move {
-                                    let ws = match tokio_tungstenite::accept_async(stream).await {
-                                        Ok(ws) => ws,
-                                        Err(err) => {
-                                            warn!("websocket handshake failed: {err}");
-                                            return;
-                                        }
-                                    };
-                                    info!("websocket client connected from {addr:?}");
-
-                                    let (mut sink, mut source) = ws.split();
-                                    loop {
-                                        tokio::select! {
-                                            outbound = outbound_rx.recv() => {
-                                                match outbound {
-                                                    Ok(text) => {
-                                                        if sink.send(Message::Text(text.into())).await.is_err() {
-                                                            break;
-                                                        }
-                                                    }
-                                                    Err(broadcast::error::RecvError::Lagged(_)) => {}
-                                                    Err(broadcast::error::RecvError::Closed) => {
-                                                        break;
-                                                    }
-                                                }
-                                            }
-                                            inbound = source.next() => {
-                                                let Some(inbound) = inbound else {
-                                                    break;
-                                                };
-                                                let message = match inbound {
-                                                    Ok(message) => message,
-                                                    Err(err) => {
-                                                        warn!("websocket read failed: {err}");
-                                                        break;
-                                                    }
-                                                };
-
-                                                let raw_text = match message {
-                                                    Message::Text(text) => Some(text.to_string()),
-                                                    Message::Binary(bytes) => std::str::from_utf8(&bytes).ok().map(ToOwned::to_owned),
-                                                    Message::Close(_) => break,
-                                                    Message::Ping(_) | Message::Pong(_) | Message::Frame(_) => None,
-                                                };
-
-                                                if let Some(raw_text) = raw_text
-                                                    && let Some(command) = parse_websocket_inbound_command(&raw_text)
-                                                {
-                                                    match command {
-                                                        WebSocketInboundCommand::Submit(text) => {
-                                                            app_event_tx.send(AppEvent::SubmitUserMessageFromExternal { text });
-                                                        }
-                                                        WebSocketInboundCommand::Interrupt => {
-                                                            app_event_tx.send(AppEvent::CodexOp(Op::Interrupt));
-                                                        }
-                                                    }
-                                                }
-                                            }
-                                        }
-                                    }
-
-                                    info!("websocket client disconnected from {addr:?}");
-                                });
-                            }
-                            Err(e) => {
-                                warn!("websocket accept error: {e}");
-                            }
-                        }
-                    }
-                }
-            }
-
-            info!("websocket streaming server on ws://{bind_addr} stopped");
-        });
-
-        Ok(())
     }
 
     fn worked_elapsed_from(&mut self, current_elapsed: u64) -> u64 {
@@ -2902,7 +2707,6 @@ impl ChatWidget {
             status_line_branch_pending: false,
             status_line_branch_lookup_complete: false,
             external_editor_state: ExternalEditorState::Closed,
-            stream_tx: None,
             pending_legacy_agent_message_skips: 0,
         };
 
@@ -3071,7 +2875,6 @@ impl ChatWidget {
             status_line_branch_pending: false,
             status_line_branch_lookup_complete: false,
             external_editor_state: ExternalEditorState::Closed,
-            stream_tx: None,
             pending_legacy_agent_message_skips: 0,
         };
 
@@ -3229,7 +3032,6 @@ impl ChatWidget {
             status_line_branch_pending: false,
             status_line_branch_lookup_complete: false,
             external_editor_state: ExternalEditorState::Closed,
-            stream_tx: None,
             pending_legacy_agent_message_skips: 0,
         };
 
@@ -6958,16 +6760,6 @@ impl ChatWidget {
             text_elements: Vec::new(),
             mention_bindings: Vec::new(),
         };
-        if should_queue {
-            self.queue_user_message(user_message);
-        } else {
-            self.submit_user_message(user_message);
-        }
-    }
-
-    pub(crate) fn submit_user_message_from_external(&mut self, text: String) {
-        let should_queue = self.is_plan_streaming_in_tui();
-        let user_message: UserMessage = text.into();
         if should_queue {
             self.queue_user_message(user_message);
         } else {

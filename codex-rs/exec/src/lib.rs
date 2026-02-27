@@ -70,8 +70,6 @@ use codex_core::default_client::set_default_client_residency_requirement;
 use codex_core::default_client::set_default_originator;
 use codex_core::find_thread_path_by_id_str;
 use codex_core::find_thread_path_by_name_str;
-use codex_protocol::items::AgentMessageContent;
-use codex_protocol::items::TurnItem;
 
 enum InitialOperation {
     UserTurn {
@@ -88,138 +86,6 @@ struct ThreadEventEnvelope {
     thread_id: codex_protocol::ThreadId,
     thread: Arc<codex_core::CodexThread>,
     event: Event,
-}
-
-const WEBSOCKET_STREAM_BIND_ADDR: &str = "127.0.0.1:8765";
-
-struct ExecWebSocketStreaming {
-    stream_tx: Option<tokio::sync::mpsc::UnboundedSender<String>>,
-    pending_legacy_agent_message_skips: usize,
-    saw_agent_message_delta_this_turn: bool,
-}
-
-impl ExecWebSocketStreaming {
-    async fn new(bind_addr: &str) -> Self {
-        let listener = match tokio::net::TcpListener::bind(bind_addr).await {
-            Ok(listener) => listener,
-            Err(err) => {
-                eprintln!("Failed to bind websocket streaming server on {bind_addr}: {err}");
-                return Self {
-                    stream_tx: None,
-                    pending_legacy_agent_message_skips: 0,
-                    saw_agent_message_delta_this_turn: false,
-                };
-            }
-        };
-
-        let (stream_tx, mut stream_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
-        let bind_addr = bind_addr.to_string();
-
-        tokio::spawn(async move {
-            use futures::SinkExt;
-            use tokio_tungstenite::tungstenite::Message;
-
-            eprintln!("WebSocket streaming server listening on ws://{bind_addr}");
-            eprintln!("Connect with: websocat ws://{bind_addr} or Python websockets client");
-
-            let mut clients: Vec<tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>> =
-                Vec::new();
-
-            loop {
-                tokio::select! {
-                    accept_result = listener.accept() => {
-                        match accept_result {
-                            Ok((stream, addr)) => match tokio_tungstenite::accept_async(stream).await {
-                                Ok(ws) => {
-                                    eprintln!("WebSocket client connected from {addr:?}");
-                                    clients.push(ws);
-                                }
-                                Err(err) => {
-                                    eprintln!("WebSocket handshake failed: {err}");
-                                }
-                            },
-                            Err(err) => {
-                                eprintln!("WebSocket accept error: {err}");
-                            }
-                        }
-                    }
-                    maybe_text = stream_rx.recv() => {
-                        let Some(text) = maybe_text else {
-                            break;
-                        };
-
-                        let mut disconnected = Vec::new();
-                        for (index, client) in clients.iter_mut().enumerate() {
-                            if client.send(Message::Text(text.clone().into())).await.is_err() {
-                                disconnected.push(index);
-                            }
-                        }
-
-                        for index in disconnected.into_iter().rev() {
-                            clients.remove(index);
-                        }
-                    }
-                }
-            }
-        });
-
-        Self {
-            stream_tx: Some(stream_tx),
-            pending_legacy_agent_message_skips: 0,
-            saw_agent_message_delta_this_turn: false,
-        }
-    }
-
-    fn handle_event(&mut self, event: &EventMsg) {
-        match event {
-            EventMsg::TurnStarted(_) | EventMsg::TurnComplete(_) | EventMsg::TurnAborted(_) => {
-                self.pending_legacy_agent_message_skips = 0;
-                self.saw_agent_message_delta_this_turn = false;
-            }
-            EventMsg::AgentMessageDelta(event) => {
-                self.saw_agent_message_delta_this_turn = true;
-                if !event.delta.is_empty() {
-                    self.send(event.delta.clone());
-                }
-            }
-            EventMsg::AgentMessage(event) => {
-                if self.pending_legacy_agent_message_skips > 0 {
-                    self.pending_legacy_agent_message_skips -= 1;
-                } else if !self.saw_agent_message_delta_this_turn && !event.message.is_empty() {
-                    self.send(event.message.clone());
-                }
-            }
-            EventMsg::ItemCompleted(event) => {
-                self.pending_legacy_agent_message_skips = 0;
-                if let TurnItem::AgentMessage(item) = &event.item {
-                    let mut fallback_text = String::new();
-                    let mut fallback_chunks = 0usize;
-                    for content in &item.content {
-                        match content {
-                            AgentMessageContent::Text { text } => {
-                                fallback_chunks += 1;
-                                fallback_text.push_str(text);
-                            }
-                        }
-                    }
-
-                    if !self.saw_agent_message_delta_this_turn && !fallback_text.is_empty() {
-                        self.send(fallback_text);
-                        self.pending_legacy_agent_message_skips = fallback_chunks;
-                    }
-                }
-            }
-            _ => {}
-        }
-    }
-
-    fn send(&self, text: String) {
-        if let Some(stream_tx) = &self.stream_tx
-            && stream_tx.send(text).is_err()
-        {
-            tracing::debug!("websocket streaming channel closed");
-        }
-    }
 }
 
 pub async fn run_main(cli: Cli, codex_linux_sandbox_exe: Option<PathBuf>) -> anyhow::Result<()> {
@@ -592,8 +458,6 @@ pub async fn run_main(cli: Cli, codex_linux_sandbox_exe: Option<PathBuf>) -> any
     // Print the effective configuration and initial request so users can see what Codex
     // is using.
     event_processor.print_config_summary(&config, &prompt_summary, &session_configured);
-    let mut websocket_streaming = ExecWebSocketStreaming::new(WEBSOCKET_STREAM_BIND_ADDR).await;
-
     info!("Codex initialized with event: {session_configured:?}");
 
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<ThreadEventEnvelope>();
@@ -682,7 +546,6 @@ pub async fn run_main(cli: Cli, codex_linux_sandbox_exe: Option<PathBuf>) -> any
             thread,
             event,
         } = envelope;
-        websocket_streaming.handle_event(&event.msg);
         if matches!(event.msg, EventMsg::Error(_)) {
             error_seen = true;
         }
@@ -993,105 +856,6 @@ fn build_review_request(args: ReviewArgs) -> anyhow::Result<ReviewRequest> {
 mod tests {
     use super::*;
     use pretty_assertions::assert_eq;
-    use tokio::sync::mpsc::error::TryRecvError;
-
-    fn completed_agent_message_event(text_chunks: &[&str]) -> EventMsg {
-        EventMsg::ItemCompleted(codex_core::protocol::ItemCompletedEvent {
-            thread_id: codex_protocol::ThreadId::new(),
-            turn_id: "turn-1".to_string(),
-            item: TurnItem::AgentMessage(codex_protocol::items::AgentMessageItem {
-                id: "item-1".to_string(),
-                content: text_chunks
-                    .iter()
-                    .map(|text| AgentMessageContent::Text {
-                        text: (*text).to_string(),
-                    })
-                    .collect(),
-                phase: None,
-            }),
-        })
-    }
-
-    #[test]
-    fn websocket_streaming_item_completed_fallback_skips_follow_up_legacy_messages() {
-        let (stream_tx, mut stream_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
-        let mut streaming = ExecWebSocketStreaming {
-            stream_tx: Some(stream_tx),
-            pending_legacy_agent_message_skips: 0,
-            saw_agent_message_delta_this_turn: false,
-        };
-
-        streaming.handle_event(&completed_agent_message_event(&["A", "B"]));
-        streaming.handle_event(&EventMsg::AgentMessage(
-            codex_core::protocol::AgentMessageEvent {
-                message: "A".to_string(),
-            },
-        ));
-        streaming.handle_event(&EventMsg::AgentMessage(
-            codex_core::protocol::AgentMessageEvent {
-                message: "B".to_string(),
-            },
-        ));
-
-        assert_eq!(stream_rx.try_recv(), Ok("AB".to_string()));
-        assert_eq!(stream_rx.try_recv(), Err(TryRecvError::Empty));
-    }
-
-    #[test]
-    fn websocket_streaming_delta_messages_do_not_duplicate_legacy_messages() {
-        let (stream_tx, mut stream_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
-        let mut streaming = ExecWebSocketStreaming {
-            stream_tx: Some(stream_tx),
-            pending_legacy_agent_message_skips: 0,
-            saw_agent_message_delta_this_turn: false,
-        };
-
-        streaming.handle_event(&EventMsg::AgentMessageDelta(
-            codex_core::protocol::AgentMessageDeltaEvent {
-                delta: "delta".to_string(),
-            },
-        ));
-        streaming.handle_event(&completed_agent_message_event(&["delta"]));
-        streaming.handle_event(&EventMsg::AgentMessage(
-            codex_core::protocol::AgentMessageEvent {
-                message: "delta".to_string(),
-            },
-        ));
-
-        assert_eq!(stream_rx.try_recv(), Ok("delta".to_string()));
-        assert_eq!(stream_rx.try_recv(), Err(TryRecvError::Empty));
-    }
-
-    #[test]
-    fn websocket_streaming_resets_state_after_turn_complete() {
-        let (stream_tx, mut stream_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
-        let mut streaming = ExecWebSocketStreaming {
-            stream_tx: Some(stream_tx),
-            pending_legacy_agent_message_skips: 0,
-            saw_agent_message_delta_this_turn: false,
-        };
-
-        streaming.handle_event(&EventMsg::AgentMessageDelta(
-            codex_core::protocol::AgentMessageDeltaEvent {
-                delta: "streamed".to_string(),
-            },
-        ));
-        streaming.handle_event(&EventMsg::TurnComplete(
-            codex_core::protocol::TurnCompleteEvent {
-                turn_id: "turn-1".to_string(),
-                last_agent_message: None,
-            },
-        ));
-        streaming.handle_event(&EventMsg::AgentMessage(
-            codex_core::protocol::AgentMessageEvent {
-                message: "final".to_string(),
-            },
-        ));
-
-        assert_eq!(stream_rx.try_recv(), Ok("streamed".to_string()));
-        assert_eq!(stream_rx.try_recv(), Ok("final".to_string()));
-        assert_eq!(stream_rx.try_recv(), Err(TryRecvError::Empty));
-    }
 
     #[test]
     fn builds_uncommitted_review_request() {

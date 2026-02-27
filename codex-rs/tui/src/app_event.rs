@@ -320,11 +320,6 @@ pub(crate) enum AppEvent {
         collaboration_mode: CollaborationModeMask,
     },
 
-    /// Submit a user message from an external client integration (for example WebSocket).
-    SubmitUserMessageFromExternal {
-        text: String,
-    },
-
     /// Open the approval popup.
     FullScreenApprovalRequest(ApprovalRequest),
 

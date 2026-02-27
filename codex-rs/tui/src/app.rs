@@ -101,7 +101,6 @@ use toml::Value as TomlValue;
 
 const EXTERNAL_EDITOR_HINT: &str = "Save and close external editor to continue.";
 const THREAD_EVENT_CHANNEL_CAPACITY: usize = 32768;
-const WEBSOCKET_STREAM_BIND_ADDR: &str = "127.0.0.1:8765";
 /// Baseline cadence for periodic stream commit animation ticks.
 ///
 /// Smooth-mode streaming drains one line per tick, so this interval controls
@@ -889,7 +888,6 @@ impl App {
         let init = self.chatwidget_init_for_forked_or_resumed_thread(tui, self.config.clone());
         let codex_op_tx = crate::chatwidget::spawn_op_forwarder(thread);
         self.chat_widget = ChatWidget::new_with_op_sender(init, codex_op_tx);
-        self.enable_websocket_streaming();
 
         self.reset_for_thread_switch(tui)?;
         self.replay_thread_snapshot(snapshot);
@@ -916,15 +914,6 @@ impl App {
         self.active_thread_rx = None;
         self.primary_thread_id = None;
         self.pending_primary_events.clear();
-    }
-
-    fn enable_websocket_streaming(&mut self) {
-        if let Err(err) = self
-            .chat_widget
-            .enable_websocket_streaming(WEBSOCKET_STREAM_BIND_ADDR.to_string())
-        {
-            tracing::warn!(error = %err, "failed to enable websocket streaming");
-        }
     }
 
     async fn drain_active_thread_events(&mut self, tui: &mut tui::Tui) -> Result<()> {
@@ -1208,8 +1197,6 @@ impl App {
             primary_session_configured: None,
             pending_primary_events: VecDeque::new(),
         };
-        app.enable_websocket_streaming();
-
         // On startup, if Agent mode (workspace-write) or ReadOnly is active, warn about world-writable dirs on Windows.
         #[cfg(target_os = "windows")]
         {
@@ -1407,7 +1394,6 @@ impl App {
                     otel_manager: self.otel_manager.clone(),
                 };
                 self.chat_widget = ChatWidget::new(init, self.server.clone());
-                self.enable_websocket_streaming();
                 self.reset_thread_event_state();
                 if let Some(summary) = summary {
                     let mut lines: Vec<Line<'static>> = vec![summary.usage_line.clone().into()];
@@ -1478,7 +1464,6 @@ impl App {
                                     resumed.thread,
                                     resumed.session_configured,
                                 );
-                                self.enable_websocket_streaming();
                                 self.reset_thread_event_state();
                                 if let Some(summary) = summary {
                                     let mut lines: Vec<Line<'static>> =
@@ -1539,7 +1524,6 @@ impl App {
                                     forked.thread,
                                     forked.session_configured,
                                 );
-                                self.enable_websocket_streaming();
                                 self.reset_thread_event_state();
                                 if let Some(summary) = summary {
                                     let mut lines: Vec<Line<'static>> =
@@ -2446,9 +2430,6 @@ impl App {
             } => {
                 self.chat_widget
                     .submit_user_message_with_mode(text, collaboration_mode);
-            }
-            AppEvent::SubmitUserMessageFromExternal { text } => {
-                self.chat_widget.submit_user_message_from_external(text);
             }
             AppEvent::ManageSkillsClosed => {
                 self.chat_widget.handle_manage_skills_closed();
