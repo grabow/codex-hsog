@@ -1059,6 +1059,31 @@ class AppServerWsRepl:
             return os.environ.get("COMSPEC", "cmd.exe")
         return os.environ.get("SHELL", "/bin/sh")
 
+    def _local_tool_process_env(self) -> dict[str, str]:
+        env = os.environ.copy()
+        inherited_venv = env.pop("VIRTUAL_ENV", None)
+        env.pop("PYTHONHOME", None)
+        env.pop("PYTHONPATH", None)
+
+        if not inherited_venv:
+            return env
+
+        path_key = "PATH" if "PATH" in env else "Path"
+        path_value = env.get(path_key)
+        if not isinstance(path_value, str) or not path_value:
+            return env
+
+        bin_dir_name = "Scripts" if os.name == "nt" else "bin"
+        inherited_venv_bin = os.path.normcase(os.path.abspath(str(Path(inherited_venv) / bin_dir_name)))
+
+        filtered_paths = [
+            entry
+            for entry in path_value.split(os.pathsep)
+            if os.path.normcase(os.path.abspath(entry)) != inherited_venv_bin
+        ]
+        env[path_key] = os.pathsep.join(filtered_paths)
+        return env
+
     def _derive_exec_argv(self, cmd: str, shell: str | None, login: bool) -> list[str]:
         shell_path = shell or self._default_shell_path()
         lower_name = Path(shell_path).name.lower()
@@ -1178,6 +1203,7 @@ class AppServerWsRepl:
             process = await asyncio.create_subprocess_exec(
                 *argv,
                 cwd=workdir,
+                env=self._local_tool_process_env(),
                 stdin=asyncio.subprocess.PIPE,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
@@ -1412,6 +1438,7 @@ class AppServerWsRepl:
             process = await asyncio.create_subprocess_exec(
                 *argv,
                 cwd=workdir,
+                env=self._local_tool_process_env(),
                 stdin=asyncio.subprocess.PIPE,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,

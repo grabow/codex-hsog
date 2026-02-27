@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import json
+import os
 import tempfile
 import unittest
+from unittest import mock
 
 import python.app_server_ws_repl as repl
 
@@ -233,6 +235,32 @@ class PersistentShellHelpersTests(unittest.TestCase):
         self.assertIn("cd '/tmp/test dir'", command)
         self.assertIn("echo hi", command)
         self.assertIn("printf 'M:%s\\n' \"$?\"", command)
+
+    def test_local_tool_process_env_removes_inherited_virtual_env(self) -> None:
+        client = self._client()
+        venv_dir = "/tmp/inherited-venv"
+        with mock.patch.dict(
+            os.environ,
+            {
+                "VIRTUAL_ENV": venv_dir,
+                "PYTHONHOME": "x",
+                "PYTHONPATH": "y",
+                "PATH": f"{venv_dir}/bin:/usr/bin:/bin",
+            },
+            clear=False,
+        ):
+            env = client._local_tool_process_env()  # noqa: SLF001
+
+        self.assertNotIn("VIRTUAL_ENV", env)
+        self.assertNotIn("PYTHONHOME", env)
+        self.assertNotIn("PYTHONPATH", env)
+        self.assertEqual(env["PATH"], "/usr/bin:/bin")
+
+    def test_local_tool_process_env_keeps_path_without_virtual_env(self) -> None:
+        client = self._client()
+        with mock.patch.dict(os.environ, {"PATH": "/usr/local/bin:/usr/bin"}, clear=False):
+            env = client._local_tool_process_env()  # noqa: SLF001
+        self.assertEqual(env["PATH"], "/usr/local/bin:/usr/bin")
 
 
 if __name__ == "__main__":
