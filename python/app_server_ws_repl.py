@@ -413,9 +413,11 @@ class AppServerWsRepl:
         self.model = model
         self.local_tool_routing = local_tool_routing
         self.local_tool_shell_mode = local_tool_shell_mode
-        self.local_tool_shell_init = (
-            local_tool_shell_init.strip() if isinstance(local_tool_shell_init, str) else None
-        )
+        if isinstance(local_tool_shell_init, str):
+            normalized_init = local_tool_shell_init.strip()
+            self.local_tool_shell_init = normalized_init or None
+        else:
+            self.local_tool_shell_init = None
         self.cwd = cwd or (os.getcwd() if local_tool_routing else None)
         self.model_provider = model_provider
         self.auto_approve = auto_approve
@@ -1077,6 +1079,8 @@ class AppServerWsRepl:
             return "powershell"
         if lower_name in {"cmd", "cmd.exe"}:
             return "cmd"
+        if lower_name in {"csh", "tcsh"}:
+            return "csh"
         return "posix"
 
     def _persistent_shell_argv(self, shell_path: str, login: bool) -> list[str]:
@@ -1089,9 +1093,32 @@ class AppServerWsRepl:
             return argv
         if shell_kind == "cmd":
             return [shell_path, "/q", "/k"]
+        if shell_kind == "csh":
+            return [shell_path, "-l"] if login else [shell_path]
         if login:
             return [shell_path, "-l"]
         return [shell_path]
+
+    def _auto_shell_init_command(self, shell_kind: str, shell_path: str | None) -> str | None:
+        if shell_kind == "powershell":
+            return "if (Test-Path $PROFILE) { . $PROFILE }"
+        if shell_kind == "cmd":
+            return None
+        if shell_kind == "csh":
+            return (
+                "if ( -f ~/.cshrc ) source ~/.cshrc; "
+                "if ( -f ~/.tcshrc ) source ~/.tcshrc; "
+                "if ( -f ~/.login ) source ~/.login"
+            )
+
+        lower_name = Path(shell_path or "").name.lower()
+        if lower_name == "zsh":
+            return "[ -f ~/.zshrc ] && source ~/.zshrc"
+        if lower_name in {"bash", "sh"}:
+            return "[ -f ~/.bashrc ] && . ~/.bashrc"
+        if lower_name in {"ksh", "mksh"}:
+            return "[ -f ~/.kshrc ] && . ~/.kshrc"
+        return "[ -f ~/.profile ] && . ~/.profile"
 
     def _command_with_marker(
         self,
@@ -1114,6 +1141,13 @@ class AppServerWsRepl:
                 f"cd /d \"{escaped_workdir}\"\r\n"
                 f"{cmd}\r\n"
                 f"echo {marker}:%errorlevel%\r\n"
+            )
+        if shell_kind == "csh":
+            escaped_workdir = workdir.replace("'", "\\'")
+            return (
+                f"cd '{escaped_workdir}'\n"
+                f"{cmd}\n"
+                f"echo {marker}:$status\n"
             )
 
         escaped_workdir = shlex.quote(workdir)
@@ -1160,10 +1194,14 @@ class AppServerWsRepl:
         )
         self._persistent_shell_session_id = session.session_id
 
-        if self.local_tool_shell_init:
+        init_command = self.local_tool_shell_init
+        if init_command == "auto":
+            init_command = self._auto_shell_init_command(session.shell_kind, session.shell_path)
+
+        if init_command:
             marker = f"__CODEX_INIT_{uuid.uuid4().hex}__"
             payload = self._command_with_marker(
-                self.local_tool_shell_init,
+                init_command,
                 workdir,
                 marker,
                 session.shell_kind,
@@ -1790,8 +1828,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--local-tool-shell-init",
-        default=None,
-        help="optional shell command executed once after starting a persistent local tool shell",
+        default="auto",
+        help=(
+            "optional shell init command for persistent mode; "
+            "use 'auto' (default) for shell-specific rc loading, empty string to disable"
+        ),
     )
     parser.add_argument(
         "--token",

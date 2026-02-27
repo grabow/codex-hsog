@@ -42,7 +42,7 @@ class ParseArgsTests(unittest.TestCase):
         self.assertTrue(args.auto_approve)
         self.assertTrue(args.local_tool_routing)
         self.assertEqual(args.local_tool_shell_mode, "subprocess")
-        self.assertIsNone(args.local_tool_shell_init)
+        self.assertEqual(args.local_tool_shell_init, "auto")
         self.assertFalse(args.show_raw_json)
         self.assertIsNone(args.token)
         self.assertIsNone(args.provider_id)
@@ -215,6 +215,17 @@ class PersistentShellHelpersTests(unittest.TestCase):
         client = self._client()
         self.assertEqual(client._persistent_shell_argv("/bin/zsh", True), ["/bin/zsh", "-l"])  # noqa: SLF001
         self.assertEqual(client._persistent_shell_argv("/bin/zsh", False), ["/bin/zsh"])  # noqa: SLF001
+
+    def test_auto_shell_init_command(self) -> None:
+        client = self._client()
+        self.assertEqual(
+            client._auto_shell_init_command("posix", "/bin/zsh"),  # noqa: SLF001
+            "[ -f ~/.zshrc ] && source ~/.zshrc",
+        )
+        self.assertIn(
+            ".cshrc",
+            client._auto_shell_init_command("csh", "/bin/tcsh") or "",  # noqa: SLF001
+        )
 
     def test_posix_command_with_marker_wraps_cd_and_printf(self) -> None:
         client = self._client()
