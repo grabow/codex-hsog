@@ -18,6 +18,26 @@ class AuthParseTests(unittest.TestCase):
         self.assertEqual(token, "query-token")
 
 
+class RedactionTests(unittest.TestCase):
+    def test_redacts_sensitive_dict_keys(self) -> None:
+        value = {
+            "apiKey": "secret-123",
+            "nested": {
+                "Authorization": "Bearer abc",
+            },
+        }
+        redacted = gateway._redact_value(value)
+        self.assertEqual(redacted["apiKey"], "<redacted>")
+        self.assertEqual(redacted["nested"]["Authorization"], "<redacted>")
+
+    def test_redacts_inline_secret_strings(self) -> None:
+        text = "Authorization: Bearer abc123 apiKey=secret"
+        redacted = gateway._redact_value(text)
+        self.assertNotIn("abc123", redacted)
+        self.assertNotIn("secret", redacted)
+        self.assertIn("<redacted>", redacted)
+
+
 class ProviderRewriteTests(unittest.TestCase):
     def test_extract_providers(self) -> None:
         params = {
@@ -93,6 +113,17 @@ class ConfigLoadTests(unittest.TestCase):
             self.assertEqual(users[0].user_id, "user-b")
             self.assertIn("state/user-b/codex_home", str(users[0].codex_home))
             self.assertIn("state/user-b/workspaces", str(users[0].workspace_root))
+
+
+class TlsValidationTests(unittest.TestCase):
+    def test_tls_paths_optional(self) -> None:
+        self.assertIsNone(gateway._resolve_tls_paths(None, None))
+
+    def test_tls_paths_require_both_files(self) -> None:
+        with self.assertRaises(ValueError):
+            gateway._resolve_tls_paths("cert.pem", None)
+        with self.assertRaises(ValueError):
+            gateway._resolve_tls_paths(None, "key.pem")
 
 
 if __name__ == "__main__":

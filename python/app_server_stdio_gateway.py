@@ -16,8 +16,11 @@ import argparse
 import asyncio
 from dataclasses import dataclass, field
 import json
+import logging
 import os
 from pathlib import Path
+import re
+import ssl
 import time
 from typing import Any
 from urllib.parse import parse_qs, urlparse
@@ -39,6 +42,24 @@ ERR_AUTH_FAILED = -32022
 ERR_PROVIDER_NOT_FOUND = -32023
 ERR_BAD_GATEWAY_PAYLOAD = -32024
 ERR_BACKEND_NOT_READY = -32025
+
+_LOG = logging.getLogger("app_server_stdio_gateway")
+_REDACTED = "<redacted>"
+_SENSITIVE_KEYS = {
+    "apikey",
+    "api_key",
+    "experimental_bearer_token",
+    "authorization",
+    "token",
+    "access_token",
+    "refresh_token",
+}
+_INLINE_SECRET_PATTERNS = [
+    re.compile(r"(?i)(authorization\s*:\s*bearer\s+)(\S+)"),
+    re.compile(r"(?i)(api[_-]?key\s*[=:]\s*)(\S+)"),
+    re.compile(r"(?i)(access[_-]?token\s*[=:]\s*)(\S+)"),
+    re.compile(r"(?i)(refresh[_-]?token\s*[=:]\s*)(\S+)"),
+]
 
 
 def _json_dumps(obj: dict[str, Any]) -> str:
@@ -71,6 +92,62 @@ def _parse_bearer_token(headers: Any, path: str) -> str | None:
             return token
 
     return None
+
+
+def _redact_value(value: Any, parent_key: str | None = None) -> Any:
+    if isinstance(value, dict):
+        redacted: dict[str, Any] = {}
+        for key, inner in value.items():
+            key_norm = key.lower()
+            if key_norm in _SENSITIVE_KEYS:
+                redacted[key] = _REDACTED
+            else:
+                redacted[key] = _redact_value(inner, parent_key=key_norm)
+        return redacted
+
+    if isinstance(value, list):
+        return [_redact_value(item, parent_key=parent_key) for item in value]
+
+    if isinstance(value, str):
+        if parent_key in _SENSITIVE_KEYS:
+            return _REDACTED
+        redacted = value
+        for pattern in _INLINE_SECRET_PATTERNS:
+            redacted = pattern.sub(rf"\\1{_REDACTED}", redacted)
+        return redacted
+
+    return value
+
+
+def _safe_error_text(exc: Exception) -> str:
+    return str(_redact_value(str(exc)))
+
+
+def _resolve_tls_paths(
+    cert_file: str | None,
+    key_file: str | None,
+) -> tuple[Path, Path] | None:
+    cert = cert_file.strip() if isinstance(cert_file, str) else ""
+    key = key_file.strip() if isinstance(key_file, str) else ""
+    if not cert and not key:
+        return None
+    if not cert or not key:
+        raise ValueError("both --tls-cert-file and --tls-key-file are required")
+    return Path(cert), Path(key)
+
+
+def _build_server_ssl_context(
+    cert_file: str | None,
+    key_file: str | None,
+) -> ssl.SSLContext | None:
+    resolved = _resolve_tls_paths(cert_file, key_file)
+    if resolved is None:
+        return None
+
+    cert_path, key_path = resolved
+    context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    context.load_cert_chain(certfile=str(cert_path), keyfile=str(key_path))
+    return context
 
 
 def _normalize_provider_entry(raw: dict[str, Any]) -> tuple[str, dict[str, Any]]:
@@ -236,7 +313,7 @@ class UserWorker:
         await self.stop("idle-timeout")
 
     async def stop(self, reason: str) -> None:
-        _ = reason
+        _LOG.info("stopping backend for user=%s reason=%s", self.user.user_id, reason)
         process = self.process
         self.process = None
         self.backend_initialized = False
@@ -281,6 +358,11 @@ class UserWorker:
 
         env = os.environ.copy()
         env["CODEX_HOME"] = str(self.user.codex_home)
+        _LOG.info(
+            "starting backend for user=%s codex_home=%s",
+            self.user.user_id,
+            self.user.codex_home,
+        )
 
         self.process = await asyncio.create_subprocess_exec(
             str(self.codex_bin),
@@ -325,6 +407,7 @@ class UserWorker:
         await self._send_backend_message({"method": "initialized", "params": {}})
         self.backend_initialized = True
         self.touch()
+        _LOG.info("backend initialized for user=%s", self.user.user_id)
 
     async def _stderr_loop(self) -> None:
         if self.process is None or self.process.stderr is None:
@@ -334,6 +417,13 @@ class UserWorker:
                 line = await self.process.stderr.readline()
                 if not line:
                     break
+                text = line.decode("utf-8", errors="replace").strip()
+                if text:
+                    _LOG.warning(
+                        "backend stderr user=%s: %s",
+                        self.user.user_id,
+                        _redact_value(text),
+                    )
         except asyncio.CancelledError:
             return
 
@@ -352,6 +442,10 @@ class UserWorker:
                 try:
                     message = json.loads(text)
                 except json.JSONDecodeError:
+                    _LOG.warning(
+                        "backend emitted non-json line user=%s",
+                        self.user.user_id,
+                    )
                     continue
                 await self._handle_backend_message(message)
         except asyncio.CancelledError:
@@ -434,6 +528,11 @@ class UserWorker:
             try:
                 client.providers = _extract_providers_from_initialize(params)
             except ValueError as exc:
+                _LOG.warning(
+                    "initialize rejected user=%s error=%s",
+                    client.user.user_id,
+                    _safe_error_text(exc),
+                )
                 await self._send_client(
                     client,
                     _jsonrpc_error(request_id, ERR_BAD_GATEWAY_PAYLOAD, str(exc)),
@@ -478,6 +577,11 @@ class UserWorker:
         if method == "thread/start":
             workspace = self._new_workspace()
             params["cwd"] = str(workspace)
+            _LOG.info(
+                "new session workspace user=%s path=%s",
+                client.user.user_id,
+                workspace,
+            )
             try:
                 _apply_provider_to_thread_start(params, client.providers)
             except KeyError as exc:
@@ -513,11 +617,13 @@ class GatewayServer:
         codex_bin: Path,
         users: list[UserConfig],
         idle_timeout_seconds: int,
+        ssl_context: ssl.SSLContext | None = None,
     ):
         self.listen_host = listen_host
         self.listen_port = listen_port
         self.idle_timeout_seconds = idle_timeout_seconds
         self.codex_bin = codex_bin
+        self.ssl_context = ssl_context
 
         self.users_by_token = {user.token: user for user in users}
         self.workers_by_user = {
@@ -531,7 +637,19 @@ class GatewayServer:
             raise RuntimeError("websockets dependency is missing; install `websockets`")
 
         self._reaper_task = asyncio.create_task(self._reaper_loop())
-        async with websockets.serve(self._handle_client, self.listen_host, self.listen_port):
+        scheme = "wss" if self.ssl_context is not None else "ws"
+        _LOG.info(
+            "gateway listening on %s://%s:%s",
+            scheme,
+            self.listen_host,
+            self.listen_port,
+        )
+        async with websockets.serve(
+            self._handle_client,
+            self.listen_host,
+            self.listen_port,
+            ssl=self.ssl_context,
+        ):
             await asyncio.Future()
 
     async def _reaper_loop(self) -> None:
@@ -553,12 +671,33 @@ class GatewayServer:
         token = _parse_bearer_token(headers, path)
         user = self.users_by_token.get(token) if token is not None else None
         if user is None:
+            _LOG.warning("connection rejected: unauthorized")
             await websocket.close(code=1008, reason="unauthorized")
             return
 
         worker = self.workers_by_user[user.user_id]
         client = ClientSession(websocket=websocket, user=user)
-        await worker.add_client(client)
+        try:
+            await worker.add_client(client)
+        except Exception as exc:
+            _LOG.exception(
+                "failed to start backend for user=%s error=%s",
+                user.user_id,
+                _safe_error_text(exc),
+            )
+            await websocket.send(
+                _json_dumps(
+                    _jsonrpc_error(
+                        None,
+                        ERR_BACKEND_NOT_READY,
+                        "backend startup failed",
+                    )
+                )
+            )
+            await websocket.close(code=1011, reason="backend startup failed")
+            return
+
+        _LOG.info("connection accepted user=%s", user.user_id)
 
         try:
             async for raw_message in websocket:
@@ -582,7 +721,22 @@ class GatewayServer:
                     continue
 
                 if "method" in message:
-                    await worker.forward_request(client, message)
+                    try:
+                        await worker.forward_request(client, message)
+                    except Exception as exc:
+                        _LOG.exception(
+                            "request handling failed user=%s error=%s",
+                            user.user_id,
+                            _safe_error_text(exc),
+                        )
+                        await worker._send_client(
+                            client,
+                            _jsonrpc_error(
+                                message.get("id"),
+                                INTERNAL_ERROR,
+                                "internal gateway error",
+                            ),
+                        )
                     continue
 
                 if "id" in message and ("result" in message or "error" in message):
@@ -594,6 +748,7 @@ class GatewayServer:
                     _jsonrpc_error(message.get("id"), INVALID_REQUEST, "invalid JSON-RPC message"),
                 )
         finally:
+            _LOG.info("connection closed user=%s", user.user_id)
             await worker.remove_client(client)
 
 
@@ -673,17 +828,43 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=300,
         help="stop per-user backend process after this idle time",
     )
+    parser.add_argument(
+        "--tls-cert-file",
+        default=None,
+        help="path to TLS certificate (enables wss when used with --tls-key-file)",
+    )
+    parser.add_argument(
+        "--tls-key-file",
+        default=None,
+        help="path to TLS private key (enables wss when used with --tls-cert-file)",
+    )
+    parser.add_argument(
+        "--log-level",
+        default="INFO",
+        choices=["DEBUG", "INFO", "WARNING", "ERROR"],
+        help="gateway log level",
+    )
     return parser.parse_args(argv)
 
 
 async def _run(args: argparse.Namespace) -> int:
+    if not logging.getLogger().handlers:
+        logging.basicConfig(
+            level=getattr(logging, str(args.log_level).upper(), logging.INFO),
+            format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+        )
+    else:
+        _LOG.setLevel(getattr(logging, str(args.log_level).upper(), logging.INFO))
+
     users = load_user_configs(Path(args.users_config), Path(args.workspace_root))
+    ssl_context = _build_server_ssl_context(args.tls_cert_file, args.tls_key_file)
     server = GatewayServer(
         listen_host=args.listen_host,
         listen_port=args.listen_port,
         codex_bin=Path(args.codex_bin),
         users=users,
         idle_timeout_seconds=args.idle_timeout_seconds,
+        ssl_context=ssl_context,
     )
     await server.run()
     return 0

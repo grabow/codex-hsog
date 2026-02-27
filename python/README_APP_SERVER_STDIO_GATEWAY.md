@@ -30,8 +30,23 @@ python/.venv/bin/python python/app_server_stdio_gateway.py \
   --users-config ./users.json \
   --codex-bin ./codex-rs/target/debug/codex \
   --listen-host 0.0.0.0 \
-  --listen-port 4321
+  --listen-port 4321 \
+  --log-level INFO
 ```
+
+### Start with TLS (`wss`)
+
+```bash
+python/.venv/bin/python python/app_server_stdio_gateway.py \
+  --users-config ./users.json \
+  --codex-bin ./codex-rs/target/debug/codex \
+  --listen-host 0.0.0.0 \
+  --listen-port 4321 \
+  --tls-cert-file /path/to/fullchain.pem \
+  --tls-key-file /path/to/privkey.pem
+```
+
+Both `--tls-cert-file` and `--tls-key-file` are required together.
 
 ## users.json
 
@@ -108,5 +123,6 @@ The gateway rewrites this into backend-compatible `modelProvider` + `config` ove
 ## Notes
 
 - Secrets are currently in-memory only per connected client.
-- This is an initial implementation focused on stdio transport and process isolation.
-- For production hardening, add TLS termination, strict logging redaction policy, and token management.
+- Backend transport remains stdio-only (`codex app-server --listen stdio://`).
+- Logging applies best-effort redaction for common secret fields/tokens.
+- Token management (rotation/revocation/audit) is still intentionally simple in this phase.
