@@ -15,6 +15,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 from dataclasses import dataclass, field
+import hashlib
 import json
 import logging
 import os
@@ -616,6 +617,8 @@ class GatewayServer:
         listen_port: int,
         codex_bin: Path,
         users: list[UserConfig],
+        workspace_root: Path,
+        allow_self_register: bool,
         idle_timeout_seconds: int,
         ssl_context: ssl.SSLContext | None = None,
     ):
@@ -624,6 +627,8 @@ class GatewayServer:
         self.idle_timeout_seconds = idle_timeout_seconds
         self.codex_bin = codex_bin
         self.ssl_context = ssl_context
+        self.workspace_root = workspace_root
+        self.allow_self_register = allow_self_register
 
         self.users_by_token = {user.token: user for user in users}
         self.workers_by_user = {
@@ -631,6 +636,33 @@ class GatewayServer:
             for user in users
         }
         self._reaper_task: asyncio.Task[None] | None = None
+
+    @staticmethod
+    def _user_id_from_token(token: str) -> str:
+        digest = hashlib.sha256(token.encode("utf-8")).hexdigest()[:16]
+        return f"user_{digest}"
+
+    def _resolve_user(self, token: str | None) -> UserConfig | None:
+        if token is None:
+            return None
+
+        existing = self.users_by_token.get(token)
+        if existing is not None:
+            return existing
+        if not self.allow_self_register:
+            return None
+
+        user_id = self._user_id_from_token(token)
+        user = UserConfig(
+            user_id=user_id,
+            token=token,
+            codex_home=self.workspace_root / user_id / "codex_home",
+            workspace_root=self.workspace_root / user_id / "workspaces",
+        )
+        self.users_by_token[token] = user
+        if user_id not in self.workers_by_user:
+            self.workers_by_user[user_id] = UserWorker(user, self.codex_bin, self.idle_timeout_seconds)
+        return user
 
     async def run(self) -> None:
         if websockets is None:
@@ -669,7 +701,7 @@ class GatewayServer:
             headers = getattr(websocket, "request_headers", None)
 
         token = _parse_bearer_token(headers, path)
-        user = self.users_by_token.get(token) if token is not None else None
+        user = self._resolve_user(token)
         if user is None:
             _LOG.warning("connection rejected: unauthorized")
             await websocket.close(code=1008, reason="unauthorized")
@@ -814,7 +846,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--users-config",
-        required=True,
+        default=None,
         help="path to users JSON config",
     )
     parser.add_argument(
@@ -844,6 +876,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         choices=["DEBUG", "INFO", "WARNING", "ERROR"],
         help="gateway log level",
     )
+    parser.add_argument(
+        "--no-self-register",
+        action="store_false",
+        dest="self_register",
+        help="disable token-based self-registration and require users from --users-config",
+    )
+    parser.set_defaults(self_register=True)
     return parser.parse_args(argv)
 
 
@@ -856,13 +895,21 @@ async def _run(args: argparse.Namespace) -> int:
     else:
         _LOG.setLevel(getattr(logging, str(args.log_level).upper(), logging.INFO))
 
-    users = load_user_configs(Path(args.users_config), Path(args.workspace_root))
+    workspace_root = Path(args.workspace_root)
+    users: list[UserConfig] = []
+    if args.users_config:
+        users = load_user_configs(Path(args.users_config), workspace_root)
+    if not args.self_register and not users:
+        raise ValueError("strict auth requires --users-config with at least one user")
+
     ssl_context = _build_server_ssl_context(args.tls_cert_file, args.tls_key_file)
     server = GatewayServer(
         listen_host=args.listen_host,
         listen_port=args.listen_port,
         codex_bin=Path(args.codex_bin),
         users=users,
+        workspace_root=workspace_root,
+        allow_self_register=bool(args.self_register),
         idle_timeout_seconds=args.idle_timeout_seconds,
         ssl_context=ssl_context,
     )

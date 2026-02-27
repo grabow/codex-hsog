@@ -18,6 +18,18 @@ class AuthParseTests(unittest.TestCase):
         self.assertEqual(token, "query-token")
 
 
+class ParseArgsTests(unittest.TestCase):
+    def test_defaults(self) -> None:
+        args = gateway.parse_args([])
+        self.assertIsNone(args.users_config)
+        self.assertTrue(args.self_register)
+
+    def test_strict_mode_flag(self) -> None:
+        args = gateway.parse_args(["--users-config", "users.json", "--no-self-register"])
+        self.assertEqual(args.users_config, "users.json")
+        self.assertFalse(args.self_register)
+
+
 class RedactionTests(unittest.TestCase):
     def test_redacts_sensitive_dict_keys(self) -> None:
         value = {
@@ -113,6 +125,33 @@ class ConfigLoadTests(unittest.TestCase):
             self.assertEqual(users[0].user_id, "user-b")
             self.assertIn("state/user-b/codex_home", str(users[0].codex_home))
             self.assertIn("state/user-b/workspaces", str(users[0].workspace_root))
+
+
+class SelfRegistrationTests(unittest.TestCase):
+    def test_user_id_from_token_is_stable(self) -> None:
+        token = "abc-123"
+        user_id_1 = gateway.GatewayServer._user_id_from_token(token)  # noqa: SLF001
+        user_id_2 = gateway.GatewayServer._user_id_from_token(token)  # noqa: SLF001
+        self.assertEqual(user_id_1, user_id_2)
+        self.assertTrue(user_id_1.startswith("user_"))
+
+    def test_resolve_user_self_register_creates_user(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            server = gateway.GatewayServer(
+                listen_host="127.0.0.1",
+                listen_port=4321,
+                codex_bin=Path("/tmp/codex"),
+                users=[],
+                workspace_root=Path(tmp),
+                allow_self_register=True,
+                idle_timeout_seconds=300,
+                ssl_context=None,
+            )
+            user = server._resolve_user("tok-1")  # noqa: SLF001
+            self.assertIsNotNone(user)
+            assert user is not None
+            self.assertEqual(server.users_by_token["tok-1"].user_id, user.user_id)
+            self.assertIn(user.user_id, server.workers_by_user)
 
 
 class TlsValidationTests(unittest.TestCase):
