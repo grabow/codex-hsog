@@ -39,6 +39,7 @@ Optional:
 - `--model <name>` set model override
 - `--model-provider <name>` set provider override
 - `--cwd <path>` set working directory override
+- `--no-local-tool-routing` disable client-side routing for `exec_command`/`write_stdin`
 
 ## Interactive commands
 
@@ -57,4 +58,6 @@ All non-`:` lines are sent as `turn/start` user text.
 
 - `item/agentMessage/delta` and `item/commandExecution/outputDelta` are streamed live.
 - Approval requests are auto-answered by default; control with `--auto-approve/--no-auto-approve`.
+- Local tool routing is enabled by default: new threads are started with dynamic tools so `exec_command` and `write_stdin` run on machine B (the Python client host).
+- For resumed older threads, local routing is guaranteed only if the thread already contains dynamic tools from a previous start with this client.
 - WebSocket app-server transport is currently marked experimental in `codex-rs/app-server/README.md`.

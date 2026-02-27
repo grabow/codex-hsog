@@ -38,6 +38,7 @@ class ParseArgsTests(unittest.TestCase):
         self.assertEqual(args.url, "ws://127.0.0.1:4222")
         self.assertEqual(args.approval_policy, "never")
         self.assertTrue(args.auto_approve)
+        self.assertTrue(args.local_tool_routing)
         self.assertFalse(args.show_raw_json)
 
     def test_overrides(self) -> None:
@@ -48,6 +49,7 @@ class ParseArgsTests(unittest.TestCase):
                 "--approval-policy",
                 "on-request",
                 "--no-auto-approve",
+                "--no-local-tool-routing",
                 "--show-raw-json",
                 "--thread-id",
                 "thr_123",
@@ -57,6 +59,7 @@ class ParseArgsTests(unittest.TestCase):
         self.assertEqual(args.url, "ws://10.0.0.2:4222")
         self.assertEqual(args.approval_policy, "on-request")
         self.assertFalse(args.auto_approve)
+        self.assertFalse(args.local_tool_routing)
         self.assertTrue(args.show_raw_json)
         self.assertEqual(args.thread_id, "thr_123")
 
@@ -100,6 +103,27 @@ class StreamFormatTests(unittest.TestCase):
     def test_ephemeral_compacts_plain_text(self) -> None:
         text = "  step   one\nstep two  "
         self.assertEqual(repl.format_ephemeral_status_text(text), "step one step two")
+
+
+class LocalToolRoutingTests(unittest.IsolatedAsyncioTestCase):
+    async def test_dynamic_tool_call_unknown(self) -> None:
+        client = repl.AppServerWsRepl(
+            uri="ws://127.0.0.1:4222",
+            approval_policy="never",
+            model=None,
+            cwd=None,
+            model_provider=None,
+            auto_approve=True,
+            final_only=True,
+            show_raw_json=False,
+            local_tool_routing=True,
+        )
+
+        result = await client._handle_dynamic_tool_call(  # noqa: SLF001
+            {"tool": "unknown_tool", "arguments": {}}
+        )
+        self.assertFalse(result["success"])
+        self.assertIn("Unsupported dynamic tool", result["contentItems"][0]["text"])
 
 
 if __name__ == "__main__":

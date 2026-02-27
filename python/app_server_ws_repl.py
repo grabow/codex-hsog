@@ -19,14 +19,18 @@ from __future__ import annotations
 import argparse
 import asyncio
 import atexit
+import contextlib
 from dataclasses import dataclass
 import json
+import os
 from pathlib import Path
+import platform
 import re
 import shlex
 import sys
 import termios
 import tty
+import uuid
 from typing import Any
 from urllib.parse import urlparse
 
@@ -40,6 +44,17 @@ except Exception:  # pragma: no cover - optional for parser-only tests
 class ReplCommand:
     kind: str
     arg: str | None = None
+
+
+@dataclass
+class LocalExecSession:
+    session_id: int
+    process: asyncio.subprocess.Process
+    output_queue: asyncio.Queue[str]
+    started_at: float
+    completion_event: asyncio.Event
+    reader_tasks: list[asyncio.Task[None]]
+    waiter_task: asyncio.Task[None]
 
 
 def parse_repl_command(line: str) -> ReplCommand:
@@ -337,11 +352,13 @@ class AppServerWsRepl:
         auto_approve: bool,
         final_only: bool,
         show_raw_json: bool,
+        local_tool_routing: bool,
     ) -> None:
         self.uri = uri
         self.approval_policy = approval_policy
         self.model = model
-        self.cwd = cwd
+        self.local_tool_routing = local_tool_routing
+        self.cwd = cwd or (os.getcwd() if local_tool_routing else None)
         self.model_provider = model_provider
         self.auto_approve = auto_approve
         self.final_only = final_only
@@ -360,6 +377,8 @@ class AppServerWsRepl:
 
         self.active_thread_id: str | None = None
         self.active_turn_id: str | None = None
+        self._next_local_session_id = 1
+        self._local_exec_sessions: dict[int, LocalExecSession] = {}
 
     def _clear_ephemeral_status(self) -> None:
         if self._ephemeral_status_active:
@@ -427,10 +446,13 @@ class AppServerWsRepl:
         user_agent = init_result.get("userAgent")
         if user_agent:
             print(f"[init] userAgent={user_agent}")
+        if self.local_tool_routing:
+            print("[local-tools] enabled (exec_command/write_stdin on client)")
 
         await self.notify("initialized", None)
 
     async def close(self) -> None:
+        await self._close_all_local_sessions()
         if self._ws is not None:
             await self._ws.close()
         if self._reader_task is not None:
@@ -493,6 +515,12 @@ class AppServerWsRepl:
             params["cwd"] = self.cwd
         if self.model_provider:
             params["modelProvider"] = self.model_provider
+        if self.local_tool_routing:
+            params["dynamicTools"] = self._local_dynamic_tools()
+            params["config"] = {
+                "features.shell_tool": False,
+            }
+            params["developerInstructions"] = self._local_environment_developer_instructions()
 
         result = await self.request("thread/start", params)
         thread_id = result["thread"]["id"]
@@ -515,6 +543,10 @@ class AppServerWsRepl:
         resumed = result["thread"]["id"]
         self.active_thread_id = resumed
         print(f"[thread] resumed {resumed}")
+        if self.local_tool_routing:
+            self._emit_status_line(
+                "[warn] local tool routing is guaranteed for new threads started via :new"
+            )
         return resumed
 
     async def list_threads(self, limit: int) -> None:
@@ -588,6 +620,21 @@ class AppServerWsRepl:
 
     async def exec_command(self, command: str) -> None:
         self._clear_ephemeral_status()
+        if self.local_tool_routing:
+            response = await self._handle_dynamic_exec_command(
+                {
+                    "cmd": command,
+                    "workdir": self.cwd,
+                    "login": True,
+                    "tty": False,
+                    "yield_time_ms": 10000,
+                }
+            )
+            content = self._content_items_to_text(response.get("contentItems") or [])
+            if content:
+                print(content, end="" if content.endswith("\n") else "\n")
+            return
+
         argv = shlex.split(command)
         if not argv:
             raise RuntimeError("empty command")
@@ -678,19 +725,9 @@ class AppServerWsRepl:
             return
 
         if method == "item/tool/call":
-            await self._send_server_response(
-                request_id,
-                {
-                    "contentItems": [
-                        {
-                            "type": "inputText",
-                            "text": "Tool call not handled by this client.",
-                        }
-                    ],
-                    "success": False,
-                },
-            )
-            self._emit_status_line("[tool] item/tool/call declined (not implemented)")
+            params = msg.get("params") or {}
+            response = await self._handle_dynamic_tool_call(params)
+            await self._send_server_response(request_id, response)
             return
 
         await self._send_server_error(
@@ -860,6 +897,330 @@ class AppServerWsRepl:
         if not self.final_only:
             self._emit_status_line(f"[{method}]")
 
+    def _local_dynamic_tools(self) -> list[dict[str, Any]]:
+        return [
+            {
+                "name": "exec_command",
+                "description": "Runs a command on the connected client machine and returns output or a session ID for ongoing interaction.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "cmd": {"type": "string"},
+                        "workdir": {"type": "string"},
+                        "shell": {"type": "string"},
+                        "login": {"type": "boolean"},
+                        "tty": {"type": "boolean"},
+                        "yield_time_ms": {"type": "number"},
+                        "max_output_tokens": {"type": "number"},
+                    },
+                    "required": ["cmd"],
+                    "additionalProperties": False,
+                },
+            },
+            {
+                "name": "write_stdin",
+                "description": "Writes characters to an existing client-side exec session and returns recent output.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "session_id": {"type": "number"},
+                        "chars": {"type": "string"},
+                        "yield_time_ms": {"type": "number"},
+                        "max_output_tokens": {"type": "number"},
+                    },
+                    "required": ["session_id"],
+                    "additionalProperties": False,
+                },
+            },
+        ]
+
+    def _local_environment_developer_instructions(self) -> str:
+        shell_name = Path(self._default_shell_path()).name
+        cwd = self.cwd or os.getcwd()
+        os_name = f"{platform.system()} {platform.release()}".strip()
+        return (
+            "Execution routing: run terminal commands on the connected client machine, not the app-server host.\n"
+            f"Client environment: os={os_name}, shell={shell_name}, cwd={cwd}.\n"
+            "Use exec_command and write_stdin for shell interactions."
+        )
+
+    def _default_shell_path(self) -> str:
+        if os.name == "nt":
+            return os.environ.get("COMSPEC", "cmd.exe")
+        return os.environ.get("SHELL", "/bin/sh")
+
+    def _derive_exec_argv(self, cmd: str, shell: str | None, login: bool) -> list[str]:
+        shell_path = shell or self._default_shell_path()
+        lower_name = Path(shell_path).name.lower()
+        if "powershell" in lower_name or lower_name == "pwsh":
+            argv = [shell_path]
+            if not login:
+                argv.append("-NoProfile")
+            argv.extend(["-Command", cmd])
+            return argv
+        if lower_name in {"cmd", "cmd.exe"}:
+            return [shell_path, "/c", cmd]
+        arg = "-lc" if login else "-c"
+        return [shell_path, arg, cmd]
+
+    async def _handle_dynamic_tool_call(self, params: dict[str, Any]) -> dict[str, Any]:
+        if not self.local_tool_routing:
+            return self._dynamic_tool_failure("Tool call not handled by this client.")
+
+        tool = str(params.get("tool") or "")
+        arguments_raw = params.get("arguments")
+        arguments = arguments_raw if isinstance(arguments_raw, dict) else {}
+
+        if tool == "exec_command":
+            return await self._handle_dynamic_exec_command(arguments)
+        if tool == "write_stdin":
+            return await self._handle_dynamic_write_stdin(arguments)
+        return self._dynamic_tool_failure(f"Unsupported dynamic tool: {tool}")
+
+    def _dynamic_tool_failure(self, text: str) -> dict[str, Any]:
+        return {
+            "contentItems": [{"type": "inputText", "text": text}],
+            "success": False,
+        }
+
+    def _dynamic_tool_success(self, text: str) -> dict[str, Any]:
+        return {
+            "contentItems": [{"type": "inputText", "text": text}],
+            "success": True,
+        }
+
+    def _content_items_to_text(self, content_items: list[dict[str, Any]]) -> str:
+        parts: list[str] = []
+        for item in content_items:
+            if item.get("type") == "inputText":
+                text = item.get("text")
+                if isinstance(text, str):
+                    parts.append(text)
+        return "".join(parts)
+
+    async def _handle_dynamic_exec_command(self, arguments: dict[str, Any]) -> dict[str, Any]:
+        cmd = arguments.get("cmd")
+        if not isinstance(cmd, str) or not cmd.strip():
+            return self._dynamic_tool_failure("exec_command requires a non-empty 'cmd' string.")
+
+        workdir_value = arguments.get("workdir")
+        workdir = (
+            str(workdir_value)
+            if isinstance(workdir_value, str) and workdir_value.strip()
+            else (self.cwd or os.getcwd())
+        )
+        shell = arguments.get("shell")
+        shell_value = shell if isinstance(shell, str) and shell.strip() else None
+        login = bool(arguments.get("login", True))
+        tty_requested = bool(arguments.get("tty", False))
+        yield_time_ms = int(arguments.get("yield_time_ms", 10000))
+        max_output_tokens_raw = arguments.get("max_output_tokens")
+        max_output_tokens = (
+            int(max_output_tokens_raw) if isinstance(max_output_tokens_raw, (int, float)) else None
+        )
+
+        argv = self._derive_exec_argv(cmd, shell_value, login)
+        process: asyncio.subprocess.Process
+        try:
+            process = await asyncio.create_subprocess_exec(
+                *argv,
+                cwd=workdir,
+                stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+        except Exception as exc:
+            return self._dynamic_tool_failure(f"exec_command failed to start: {exc}")
+
+        session = self._register_local_session(process)
+        output, _original_token_count = await self._collect_session_output(
+            session=session,
+            yield_time_ms=yield_time_ms,
+            max_output_tokens=max_output_tokens,
+        )
+        running = not session.completion_event.is_set()
+        if not running:
+            await self._finalize_local_session(session.session_id)
+
+        text = self._format_dynamic_exec_output(
+            session=session,
+            output=output,
+            include_session_id=running,
+            tty_requested=tty_requested,
+        )
+        return self._dynamic_tool_success(text)
+
+    async def _handle_dynamic_write_stdin(self, arguments: dict[str, Any]) -> dict[str, Any]:
+        session_id_raw = arguments.get("session_id")
+        if not isinstance(session_id_raw, (int, float)):
+            return self._dynamic_tool_failure("write_stdin requires numeric 'session_id'.")
+        session_id = int(session_id_raw)
+        session = self._local_exec_sessions.get(session_id)
+        if session is None:
+            return self._dynamic_tool_failure(f"Unknown session_id: {session_id}")
+
+        chars = arguments.get("chars", "")
+        if not isinstance(chars, str):
+            return self._dynamic_tool_failure("write_stdin 'chars' must be a string.")
+        yield_time_ms = int(arguments.get("yield_time_ms", 250))
+        max_output_tokens_raw = arguments.get("max_output_tokens")
+        max_output_tokens = (
+            int(max_output_tokens_raw) if isinstance(max_output_tokens_raw, (int, float)) else None
+        )
+
+        stdin = session.process.stdin
+        if chars and stdin is not None and not stdin.is_closing():
+            stdin.write(chars.encode("utf-8", errors="replace"))
+            with contextlib.suppress(Exception):
+                await stdin.drain()
+
+        output, _original_token_count = await self._collect_session_output(
+            session=session,
+            yield_time_ms=yield_time_ms,
+            max_output_tokens=max_output_tokens,
+        )
+        running = not session.completion_event.is_set()
+        if not running:
+            await self._finalize_local_session(session.session_id)
+
+        text = self._format_dynamic_exec_output(
+            session=session,
+            output=output,
+            include_session_id=running,
+            tty_requested=False,
+        )
+        return self._dynamic_tool_success(text)
+
+    def _register_local_session(self, process: asyncio.subprocess.Process) -> LocalExecSession:
+        session_id = self._next_local_session_id
+        self._next_local_session_id += 1
+
+        output_queue: asyncio.Queue[str] = asyncio.Queue()
+        completion_event = asyncio.Event()
+
+        async def stream_reader(stream: asyncio.StreamReader | None) -> None:
+            if stream is None:
+                return
+            while True:
+                chunk = await stream.read(4096)
+                if not chunk:
+                    return
+                text = chunk.decode("utf-8", errors="replace")
+                await output_queue.put(text)
+
+        async def wait_for_exit() -> None:
+            with contextlib.suppress(Exception):
+                await process.wait()
+            completion_event.set()
+
+        reader_tasks = [
+            asyncio.create_task(stream_reader(process.stdout)),
+            asyncio.create_task(stream_reader(process.stderr)),
+        ]
+        waiter_task = asyncio.create_task(wait_for_exit())
+
+        session = LocalExecSession(
+            session_id=session_id,
+            process=process,
+            output_queue=output_queue,
+            started_at=asyncio.get_running_loop().time(),
+            completion_event=completion_event,
+            reader_tasks=reader_tasks,
+            waiter_task=waiter_task,
+        )
+        self._local_exec_sessions[session_id] = session
+        return session
+
+    async def _collect_session_output(
+        self,
+        session: LocalExecSession,
+        yield_time_ms: int,
+        max_output_tokens: int | None,
+    ) -> tuple[str, int]:
+        loop = asyncio.get_running_loop()
+        timeout_seconds = max(yield_time_ms, 0) / 1000.0
+        deadline = loop.time() + timeout_seconds
+        chunks: list[str] = []
+
+        while True:
+            if session.completion_event.is_set() and session.output_queue.empty():
+                break
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                break
+            try:
+                chunk = await asyncio.wait_for(session.output_queue.get(), timeout=remaining)
+            except TimeoutError:
+                break
+            chunks.append(chunk)
+            while True:
+                try:
+                    chunks.append(session.output_queue.get_nowait())
+                except asyncio.QueueEmpty:
+                    break
+
+        output = "".join(chunks)
+        original_token_count = max(1, len(output) // 4) if output else 0
+        if max_output_tokens is not None and max_output_tokens >= 0:
+            max_chars = max_output_tokens * 4
+            if len(output) > max_chars:
+                output = output[:max_chars]
+        return output, original_token_count
+
+    def _format_dynamic_exec_output(
+        self,
+        session: LocalExecSession,
+        output: str,
+        include_session_id: bool,
+        tty_requested: bool,
+    ) -> str:
+        wall_time_seconds = asyncio.get_running_loop().time() - session.started_at
+        sections = [
+            f"Chunk ID: local-{session.session_id}-{uuid.uuid4().hex[:6]}",
+            f"Wall time: {wall_time_seconds:.4f} seconds",
+        ]
+        if include_session_id:
+            sections.append(f"Process running with session ID {session.session_id}")
+        else:
+            exit_code = session.process.returncode
+            if exit_code is not None:
+                sections.append(f"Process exited with code {exit_code}")
+        if tty_requested:
+            sections.append("TTY requested but not supported by this client; used pipes instead.")
+        sections.append("Output:")
+        sections.append(output)
+        return "\n".join(sections)
+
+    async def _finalize_local_session(self, session_id: int) -> None:
+        session = self._local_exec_sessions.pop(session_id, None)
+        if session is None:
+            return
+
+        for task in session.reader_tasks:
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+        with contextlib.suppress(asyncio.CancelledError):
+            session.waiter_task.cancel()
+            await session.waiter_task
+
+    async def _close_all_local_sessions(self) -> None:
+        for session_id in list(self._local_exec_sessions.keys()):
+            session = self._local_exec_sessions.get(session_id)
+            if session is None:
+                continue
+            if session.process.returncode is None:
+                with contextlib.suppress(ProcessLookupError):
+                    session.process.terminate()
+                try:
+                    await asyncio.wait_for(session.process.wait(), timeout=1.0)
+                except TimeoutError:
+                    with contextlib.suppress(ProcessLookupError):
+                        session.process.kill()
+                    with contextlib.suppress(Exception):
+                        await session.process.wait()
+            await self._finalize_local_session(session_id)
+
 
 def print_help() -> None:
     print(
@@ -871,7 +1232,7 @@ Commands:
   :use <thread-id>          Switch active thread locally (no RPC)
   :threads [limit]          List recent threads (default 20)
   :interrupt [turn-id]      Interrupt active turn (or explicit turn id)
-  :exec <shell command>     Run command/exec directly on server
+  :exec <shell command>     Run local exec on this client (or server if local routing is disabled)
   :quit                     Exit
 
 Any line without ':' is sent as a new user turn (turn/start).
@@ -892,6 +1253,7 @@ async def run_repl(args: argparse.Namespace) -> int:
         auto_approve=args.auto_approve,
         final_only=args.final_only,
         show_raw_json=args.show_raw_json,
+        local_tool_routing=args.local_tool_routing,
     )
     await repl.connect()
     try:
@@ -1010,6 +1372,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--show-raw-json",
         action="store_true",
         help="print full JSON params for notifications (debug)",
+    )
+    parser.add_argument(
+        "--local-tool-routing",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="route exec_command/write_stdin tool calls to this client machine",
     )
     return parser.parse_args(argv)
 
