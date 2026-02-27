@@ -26,6 +26,15 @@ The Rust implementation is now the maintained Codex CLI and serves as the defaul
 
 Codex supports a rich set of configuration options. Note that the Rust CLI uses `config.toml` instead of `config.json`. See [`docs/config.md`](../docs/config.md) for details.
 
+#### Provider fallback behavior (chat-only providers)
+
+Some providers expose only Chat Completions while Codex internally targets the Responses API shape. In those setups:
+
+- keep `wire_api = "responses"` and enable `fallback_chat = true` on the provider so Codex can translate Responses requests to Chat Completions on `404`.
+- when Chat streaming contains real `tool_calls`, Codex treats the turn as a tool-call turn and suppresses mixed pseudo-tool text payloads.
+- this also applies if a provider sends `finish_reason = "stop"` while still streaming tool-call deltas.
+- in chat fallback request translation, only `type = "function"` tools are forwarded; non-function tools (for example `type = "custom"`) are ignored.
+
 ### Model Context Protocol Support
 
 #### MCP client

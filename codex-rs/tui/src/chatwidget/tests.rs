@@ -1664,6 +1664,8 @@ async fn make_chatwidget_manual(
         status_line_branch_pending: false,
         status_line_branch_lookup_complete: false,
         external_editor_state: ExternalEditorState::Closed,
+        stream_tx: None,
+        pending_legacy_agent_message_skips: 0,
     };
     widget.set_model(&resolved_model);
     (widget, rx, op_rx)
@@ -7339,4 +7341,35 @@ async fn review_queues_user_messages_snapshot() {
     })
     .unwrap();
     assert_snapshot!(term.backend().vt100().screen().contents());
+}
+
+#[test]
+fn parse_websocket_inbound_command_maps_plain_text_to_submit() {
+    let parsed = parse_websocket_inbound_command("hello from websocket");
+
+    assert_eq!(
+        parsed,
+        Some(WebSocketInboundCommand::Submit(
+            "hello from websocket".to_string()
+        ))
+    );
+}
+
+#[test]
+fn parse_websocket_inbound_command_reads_json_text_field() {
+    let parsed = parse_websocket_inbound_command(r#"{"text":"hello json"}"#);
+
+    assert_eq!(
+        parsed,
+        Some(WebSocketInboundCommand::Submit("hello json".to_string()))
+    );
+}
+
+#[test]
+fn parse_websocket_inbound_command_handles_interrupt_aliases() {
+    let slash = parse_websocket_inbound_command("/interrupt");
+    let json = parse_websocket_inbound_command(r#"{"type":"stop"}"#);
+
+    assert_eq!(slash, Some(WebSocketInboundCommand::Interrupt));
+    assert_eq!(json, Some(WebSocketInboundCommand::Interrupt));
 }

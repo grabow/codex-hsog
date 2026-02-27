@@ -512,6 +512,16 @@
           "description": "Value to use with `Authorization: Bearer <token>` header. Use of this config is discouraged in favor of `env_key` for security reasons, but this may be necessary when using this programmatically.",
           "type": "string"
         },
+        "fallback_chat": {
+          "default": false,
+          "description": "Whether to fall back to the legacy Chat Completions API (`/v1/chat/completions`) when the Responses API returns a 404 error.",
+          "type": "boolean"
+        },
+        "fallback_chat_path": {
+          "default": null,
+          "description": "Custom path for the Chat Completions fallback endpoint. Defaults to \"/v1/chat/completions\" if not specified.",
+          "type": "string"
+        },
         "http_headers": {
           "additionalProperties": {
             "type": "string"

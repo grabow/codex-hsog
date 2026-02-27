@@ -16,6 +16,7 @@ use codex_protocol::protocol::TokenUsage;
 use eventsource_stream::Eventsource;
 use futures::StreamExt;
 use serde::Deserialize;
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::sync::OnceLock;
 use std::time::Duration;
@@ -71,7 +72,14 @@ pub fn spawn_chat_stream(
         if let Some(etag) = models_etag {
             let _ = tx_event.send(Ok(ResponseEvent::ModelsEtag(etag))).await;
         }
-        process_chat_sse(stream_response.bytes, tx_event, idle_timeout, telemetry, turn_state).await;
+        process_chat_sse(
+            stream_response.bytes,
+            tx_event,
+            idle_timeout,
+            telemetry,
+            turn_state,
+        )
+        .await;
     });
 
     ResponseStream { rx_event }
@@ -94,13 +102,12 @@ async fn process_chat_sse(
     tx_event: mpsc::Sender<Result<ResponseEvent, ApiError>>,
     idle_timeout: Duration,
     telemetry: Option<Arc<dyn SseTelemetry>>,
-    turn_state: Option<Arc<OnceLock<String>>>,
+    _turn_state: Option<Arc<OnceLock<String>>>,
 ) {
     let mut stream = stream.eventsource();
     let mut buffer = String::new();
     let mut response_id = String::new();
-    let mut finished = false;
-    let mut item_added = false; // Track if OutputItemAdded was emitted
+    let mut tool_calls = ChatToolCallsState::default();
 
     loop {
         let start = Instant::now();
@@ -117,13 +124,19 @@ async fn process_chat_sse(
                 return;
             }
             Ok(None) => {
-                // Stream ended - emit completion if not already done
-                if !finished && !buffer.is_empty() {
-                    emit_content_delta(&tx_event, &mut buffer).await;
-                    emit_completion(&tx_event, &response_id, None).await;
-                } else if !finished {
-                    emit_completion(&tx_event, &response_id, None).await;
+                // Stream ended - flush pending content or tool calls, then complete.
+                if let Err(err) = emit_pending_output(
+                    &tx_event,
+                    &mut buffer,
+                    &mut tool_calls,
+                    response_id.as_str(),
+                )
+                .await
+                {
+                    let _ = tx_event.send(Err(err)).await;
+                    return;
                 }
+                emit_completion(&tx_event, &response_id, None).await;
                 return;
             }
             Err(_) => {
@@ -139,62 +152,71 @@ async fn process_chat_sse(
         // Parse Chat Completions chunk
         match parse_chat_chunk(&sse.data) {
             Ok(Some(chunk)) => {
-                // Check for usage information first (might come in final chunk)
-                if let Some(ref usage) = chunk.usage {
-                    let token_usage = TokenUsage {
-                        input_tokens: usage.prompt_tokens as i64,
-                        cached_input_tokens: 0,
-                        output_tokens: usage.completion_tokens as i64,
-                        reasoning_output_tokens: 0,
-                        total_tokens: usage.total_tokens as i64,
-                    };
-                    // Emit completion with usage if we have content
-                    if item_added {
-                        emit_content_delta(&tx_event, &mut buffer).await;
-                    }
-                    emit_completion(&tx_event, &chunk.id, Some(token_usage)).await;
-                    return;
+                if !chunk.id.is_empty() {
+                    response_id = chunk.id.clone();
                 }
 
-                // Extract content deltas and emit them
+                let token_usage = chunk.usage.as_ref().map(|usage| TokenUsage {
+                    input_tokens: usage.prompt_tokens as i64,
+                    cached_input_tokens: 0,
+                    output_tokens: usage.completion_tokens as i64,
+                    reasoning_output_tokens: 0,
+                    total_tokens: usage.total_tokens as i64,
+                });
+
+                // Accumulate streamed content and tool-call deltas. We only emit
+                // text when the turn is known to be text-only, so provider
+                // pseudo-tool text does not leak into user-visible output.
                 for choice in &chunk.choices {
                     if let Some(ref content) = choice.delta.content {
                         buffer.push_str(content);
-
-                        // First time we receive content, emit OutputItemAdded to create the active item
-                        if !item_added {
-                            let _ = tx_event
-                                .send(Ok(ResponseEvent::OutputItemAdded(ResponseItem::Message {
-                                    id: None,
-                                    role: "assistant".to_string(),
-                                    content: vec![],
-                                    end_turn: None,
-                                    phase: None,
-                                })))
-                                .await;
-                            item_added = true;
+                    }
+                    if let Some(delta_tool_calls) = choice.delta.tool_calls.as_ref() {
+                        for delta_tool_call in delta_tool_calls {
+                            tool_calls.push_tool_call_delta(delta_tool_call);
                         }
-
-                        // Emit as OutputTextDelta for real-time display
-                        if tx_event
-                            .send(Ok(ResponseEvent::OutputTextDelta(content.to_string())))
-                            .await
-                            .is_err()
-                        {
-                            return;
-                        }
+                    }
+                    if let Some(legacy_function_call) = choice.delta.function_call.as_ref() {
+                        tool_calls.push_legacy_function_call_delta(legacy_function_call);
                     }
 
                     // Check for completion (finish_reason set)
                     if choice.finish_reason.is_some() {
-                        // Emit completion when finish_reason is received
-                        if item_added {
-                            emit_content_delta(&tx_event, &mut buffer).await;
+                        if let Err(err) = emit_pending_output(
+                            &tx_event,
+                            &mut buffer,
+                            &mut tool_calls,
+                            response_id.as_str(),
+                        )
+                        .await
+                        {
+                            let _ = tx_event.send(Err(err)).await;
+                            return;
                         }
-                        emit_completion(&tx_event, &chunk.id, None).await;
-                        finished = true;
+                        emit_completion(&tx_event, &response_id, token_usage).await;
                         return;
                     }
+                }
+
+                // Some providers emit usage in a final no-op chunk after all deltas.
+                if token_usage.is_some() && !chunk.choices.is_empty() {
+                    continue;
+                }
+
+                if token_usage.is_some() {
+                    if let Err(err) = emit_pending_output(
+                        &tx_event,
+                        &mut buffer,
+                        &mut tool_calls,
+                        response_id.as_str(),
+                    )
+                    .await
+                    {
+                        let _ = tx_event.send(Err(err)).await;
+                        return;
+                    }
+                    emit_completion(&tx_event, &response_id, token_usage).await;
+                    return;
                 }
             }
             Ok(None) => {
@@ -208,12 +230,21 @@ async fn process_chat_sse(
     }
 }
 
-/// Emits a content delta event and clears the buffer.
-async fn emit_content_delta(
+/// Emits a completed assistant message event and clears the buffer.
+async fn emit_content_message(
     tx_event: &mpsc::Sender<Result<ResponseEvent, ApiError>>,
     buffer: &mut String,
 ) {
     if !buffer.is_empty() {
+        let _ = tx_event
+            .send(Ok(ResponseEvent::OutputItemAdded(ResponseItem::Message {
+                id: None,
+                role: "assistant".to_string(),
+                content: vec![],
+                end_turn: None,
+                phase: None,
+            })))
+            .await;
         let _ = tx_event
             .send(Ok(ResponseEvent::OutputItemDone(ResponseItem::Message {
                 id: None,
@@ -226,6 +257,23 @@ async fn emit_content_delta(
             })))
             .await;
         buffer.clear();
+    }
+}
+
+async fn emit_pending_output(
+    tx_event: &mpsc::Sender<Result<ResponseEvent, ApiError>>,
+    buffer: &mut String,
+    tool_calls: &mut ChatToolCallsState,
+    response_id: &str,
+) -> Result<(), ApiError> {
+    if tool_calls.has_pending() {
+        // Some providers emit explanatory text content together with real
+        // tool_calls. Drop text and treat the turn as a tool-call turn.
+        buffer.clear();
+        tool_calls.emit_tool_call_items(tx_event, response_id).await
+    } else {
+        emit_content_message(tx_event, buffer).await;
+        Ok(())
     }
 }
 
@@ -288,6 +336,10 @@ struct ChatDeltaContent {
     role: Option<String>,
     #[serde(default)]
     content: Option<String>,
+    #[serde(default)]
+    tool_calls: Option<Vec<ChatToolCallDelta>>,
+    #[serde(default)]
+    function_call: Option<ChatFunctionCallDelta>,
 }
 
 #[derive(Debug, Deserialize, PartialEq)]
@@ -297,11 +349,185 @@ struct ChatUsage {
     total_tokens: u32,
 }
 
+#[derive(Debug, Deserialize, PartialEq)]
+struct ChatToolCallDelta {
+    index: usize,
+    #[serde(default)]
+    id: Option<String>,
+    #[serde(default, rename = "type")]
+    kind: Option<String>,
+    #[serde(default)]
+    function: Option<ChatFunctionCallDelta>,
+}
+
+#[derive(Debug, Deserialize, PartialEq)]
+struct ChatFunctionCallDelta {
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    arguments: Option<String>,
+}
+
+#[derive(Debug, Default)]
+struct ChatToolCallsState {
+    tool_calls: BTreeMap<usize, AccumulatedToolCall>,
+    legacy_function_call: Option<AccumulatedToolCall>,
+}
+
+impl ChatToolCallsState {
+    fn push_tool_call_delta(&mut self, delta: &ChatToolCallDelta) {
+        let state = self.tool_calls.entry(delta.index).or_default();
+        state.apply(
+            delta.id.as_deref(),
+            delta.kind.as_deref(),
+            delta.function.as_ref(),
+        );
+    }
+
+    fn push_legacy_function_call_delta(&mut self, delta: &ChatFunctionCallDelta) {
+        let state = self
+            .legacy_function_call
+            .get_or_insert_with(AccumulatedToolCall::default);
+        state.apply(None, Some("function"), Some(delta));
+    }
+
+    fn has_pending(&self) -> bool {
+        !self.tool_calls.is_empty() || self.legacy_function_call.is_some()
+    }
+
+    async fn emit_tool_call_items(
+        &mut self,
+        tx_event: &mpsc::Sender<Result<ResponseEvent, ApiError>>,
+        response_id: &str,
+    ) -> Result<(), ApiError> {
+        if self.tool_calls.is_empty() && self.legacy_function_call.is_none() {
+            return Err(ApiError::Stream(
+                "chat completion finished with tool_calls but no tool call payload was received"
+                    .to_string(),
+            ));
+        }
+
+        for (index, state) in &self.tool_calls {
+            let kind = state.kind.as_deref().unwrap_or("function");
+            if kind != "function" {
+                return Err(ApiError::Stream(format!(
+                    "chat completion emitted unsupported tool call type `{kind}`"
+                )));
+            }
+
+            let name = state.name.clone().ok_or_else(|| {
+                ApiError::Stream("chat completion tool call is missing function name".to_string())
+            })?;
+            let call_id = state.call_id.clone().unwrap_or_else(|| {
+                if response_id.is_empty() {
+                    format!("chat-tool-call-{index}")
+                } else {
+                    format!("{response_id}-tool-{index}")
+                }
+            });
+            let arguments = if state.arguments.is_empty() {
+                "{}".to_string()
+            } else {
+                state.arguments.clone()
+            };
+            tx_event
+                .send(Ok(ResponseEvent::OutputItemDone(
+                    ResponseItem::FunctionCall {
+                        id: None,
+                        name,
+                        arguments,
+                        call_id,
+                    },
+                )))
+                .await
+                .map_err(|_| {
+                    ApiError::Stream("chat fallback event channel is closed".to_string())
+                })?;
+        }
+
+        if let Some(state) = self.legacy_function_call.as_ref() {
+            let name = state.name.clone().ok_or_else(|| {
+                ApiError::Stream(
+                    "legacy function_call payload is missing function name".to_string(),
+                )
+            })?;
+            let call_id = state.call_id.clone().unwrap_or_else(|| {
+                if response_id.is_empty() {
+                    "chat-tool-call-legacy-0".to_string()
+                } else {
+                    format!("{response_id}-tool-legacy-0")
+                }
+            });
+            let arguments = if state.arguments.is_empty() {
+                "{}".to_string()
+            } else {
+                state.arguments.clone()
+            };
+            tx_event
+                .send(Ok(ResponseEvent::OutputItemDone(
+                    ResponseItem::FunctionCall {
+                        id: None,
+                        name,
+                        arguments,
+                        call_id,
+                    },
+                )))
+                .await
+                .map_err(|_| {
+                    ApiError::Stream("chat fallback event channel is closed".to_string())
+                })?;
+        }
+
+        self.tool_calls.clear();
+        self.legacy_function_call = None;
+        Ok(())
+    }
+}
+
+#[derive(Debug, Default)]
+struct AccumulatedToolCall {
+    call_id: Option<String>,
+    kind: Option<String>,
+    name: Option<String>,
+    arguments: String,
+}
+
+impl AccumulatedToolCall {
+    fn apply(
+        &mut self,
+        call_id: Option<&str>,
+        kind: Option<&str>,
+        function: Option<&ChatFunctionCallDelta>,
+    ) {
+        if self.call_id.is_none()
+            && let Some(call_id) = call_id
+        {
+            self.call_id = Some(call_id.to_string());
+        }
+        if self.kind.is_none()
+            && let Some(kind) = kind
+        {
+            self.kind = Some(kind.to_string());
+        }
+        if let Some(function) = function {
+            if self.name.is_none()
+                && let Some(name) = function.name.as_deref()
+            {
+                self.name = Some(name.to_string());
+            }
+            if let Some(arguments) = function.arguments.as_deref() {
+                self.arguments.push_str(arguments);
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use codex_client::TransportError;
     use futures::TryStreamExt;
+    use pretty_assertions::assert_eq;
     use std::io::Cursor;
     use tokio_util::io::ReaderStream;
 
@@ -319,6 +545,7 @@ mod tests {
             Box::pin(stream),
             tx,
             Duration::from_millis(1000),
+            None,
             None,
         ));
 
@@ -338,14 +565,16 @@ mod tests {
 
         let events = collect_chat_events(&[chunk1, chunk2, chunk3, chunk4]).await;
 
-        // Should have at least text deltas and completion
-        assert!(events.len() >= 2);
-
-        // Check for text delta
-        let has_hello = events.iter().any(|e| {
-            matches!(e, Ok(ResponseEvent::OutputTextDelta(text)) if text.contains("Hello"))
+        let message = events.iter().find_map(|event| match event {
+            Ok(ResponseEvent::OutputItemDone(ResponseItem::Message { content, .. })) => {
+                content.iter().find_map(|item| match item {
+                    ContentItem::OutputText { text } => Some(text.clone()),
+                    _ => None,
+                })
+            }
+            _ => None,
         });
-        assert!(has_hello);
+        assert_eq!(message, Some("Hello world".to_string()));
     }
 
     #[tokio::test]
@@ -381,5 +610,101 @@ mod tests {
         let data = r#"{"invalid json"#;
         let result = parse_chat_chunk(data);
         assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_chat_sse_tool_calls_stream() {
+        let chunk1 = b"data: {\"id\":\"chatcmpl-tools\",\"object\":\"chat.completion.chunk\",\"created\":1699000000,\"model\":\"gpt-4\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"exec\",\"arguments\":\"{\\\"cmd\\\":\\\"\"}}]},\"finish_reason\":null}]}\n\n";
+        let chunk2 = b"data: {\"id\":\"chatcmpl-tools\",\"object\":\"chat.completion.chunk\",\"created\":1699000000,\"model\":\"gpt-4\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"ls\\\"}\"}}]},\"finish_reason\":null}]}\n\n";
+        let chunk3 = b"data: {\"id\":\"chatcmpl-tools\",\"object\":\"chat.completion.chunk\",\"created\":1699000000,\"model\":\"gpt-4\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n";
+        let chunk4 = b"data: [DONE]\n\n";
+
+        let events = collect_chat_events(&[chunk1, chunk2, chunk3, chunk4]).await;
+
+        let function_call = events.iter().find_map(|event| match event {
+            Ok(ResponseEvent::OutputItemDone(ResponseItem::FunctionCall {
+                name,
+                arguments,
+                call_id,
+                ..
+            })) => Some((name.clone(), arguments.clone(), call_id.clone())),
+            _ => None,
+        });
+        assert_eq!(
+            function_call,
+            Some((
+                "exec".to_string(),
+                "{\"cmd\":\"ls\"}".to_string(),
+                "call_1".to_string(),
+            ))
+        );
+
+        let completed_response_id = events.iter().find_map(|event| match event {
+            Ok(ResponseEvent::Completed { response_id, .. }) => Some(response_id.clone()),
+            _ => None,
+        });
+        assert_eq!(completed_response_id, Some("chatcmpl-tools".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_chat_sse_tool_calls_with_stop_finish_reason_prefer_tool_call() {
+        let chunk1 = b"data: {\"id\":\"chatcmpl-tools-stop\",\"object\":\"chat.completion.chunk\",\"created\":1699000000,\"model\":\"gpt-4\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"{\\\"command\\\":\\\"ls -la\\\"}\",\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"exec\",\"arguments\":\"{\\\"cmd\\\":\\\"\"}}]},\"finish_reason\":null}]}\n\n";
+        let chunk2 = b"data: {\"id\":\"chatcmpl-tools-stop\",\"object\":\"chat.completion.chunk\",\"created\":1699000000,\"model\":\"gpt-4\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"ls -la\\\"}\"}}]},\"finish_reason\":\"stop\"}]}\n\n";
+
+        let events = collect_chat_events(&[chunk1, chunk2]).await;
+
+        let function_call = events.iter().find_map(|event| match event {
+            Ok(ResponseEvent::OutputItemDone(ResponseItem::FunctionCall {
+                name,
+                arguments,
+                call_id,
+                ..
+            })) => Some((name.clone(), arguments.clone(), call_id.clone())),
+            _ => None,
+        });
+        assert_eq!(
+            function_call,
+            Some((
+                "exec".to_string(),
+                "{\"cmd\":\"ls -la\"}".to_string(),
+                "call_1".to_string(),
+            ))
+        );
+
+        let emitted_text = events.iter().any(|event| {
+            matches!(
+                event,
+                Ok(ResponseEvent::OutputItemDone(ResponseItem::Message { .. }))
+                    | Ok(ResponseEvent::OutputTextDelta(_))
+            )
+        });
+        assert!(!emitted_text);
+    }
+
+    #[tokio::test]
+    async fn test_chat_sse_legacy_function_call_stream() {
+        let chunk1 = b"data: {\"id\":\"chatcmpl-legacy\",\"object\":\"chat.completion.chunk\",\"created\":1699000000,\"model\":\"gpt-4\",\"choices\":[{\"index\":0,\"delta\":{\"function_call\":{\"name\":\"exec\",\"arguments\":\"{\\\"cmd\\\":\\\"echo\"}},\"finish_reason\":null}]}\n\n";
+        let chunk2 = b"data: {\"id\":\"chatcmpl-legacy\",\"object\":\"chat.completion.chunk\",\"created\":1699000000,\"model\":\"gpt-4\",\"choices\":[{\"index\":0,\"delta\":{\"function_call\":{\"arguments\":\" hi\\\"}\"}},\"finish_reason\":null}]}\n\n";
+        let chunk3 = b"data: {\"id\":\"chatcmpl-legacy\",\"object\":\"chat.completion.chunk\",\"created\":1699000000,\"model\":\"gpt-4\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"function_call\"}]}\n\n";
+
+        let events = collect_chat_events(&[chunk1, chunk2, chunk3]).await;
+
+        let function_call = events.iter().find_map(|event| match event {
+            Ok(ResponseEvent::OutputItemDone(ResponseItem::FunctionCall {
+                name,
+                arguments,
+                call_id,
+                ..
+            })) => Some((name.clone(), arguments.clone(), call_id.clone())),
+            _ => None,
+        });
+        assert_eq!(
+            function_call,
+            Some((
+                "exec".to_string(),
+                "{\"cmd\":\"echo hi\"}".to_string(),
+                "chatcmpl-legacy-tool-legacy-0".to_string(),
+            ))
+        );
     }
 }

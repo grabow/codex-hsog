@@ -35,6 +35,8 @@ use crate::api_bridge::CoreAuthProvider;
 use crate::api_bridge::auth_provider_from_auth;
 use crate::api_bridge::map_api_error;
 use crate::auth::UnauthorizedRecovery;
+use codex_api::ChatCompletionsClient;
+use codex_api::ChatCompletionsOptions;
 use codex_api::CompactClient as ApiCompactClient;
 use codex_api::CompactionInput as ApiCompactionInput;
 use codex_api::MemoriesClient as ApiMemoriesClient;
@@ -54,8 +56,6 @@ use codex_api::SseTelemetry;
 use codex_api::TransportError;
 use codex_api::WebsocketTelemetry;
 use codex_api::build_conversation_headers;
-use codex_api::ChatCompletionsClient;
-use codex_api::ChatCompletionsOptions;
 use codex_api::common::Reasoning;
 use codex_api::common::ResponsesWsRequest;
 use codex_api::create_text_param_for_request;
@@ -838,8 +838,17 @@ impl ModelClientSession {
                 ReasoningSummaryConfig::None,
             )?;
 
-            // Translate to Chat Completions format
-            let chat_request = codex_api::responses_to_chat_request(&responses_request);
+            // Translate to Chat Completions format.
+            let chat_request =
+                codex_api::responses_to_chat_request(&responses_request).map_err(|err| {
+                    CodexErr::Stream(
+                        format!(
+                            "chat fallback request translation failed for provider `{}`: {err}",
+                            self.client.state.provider.name
+                        ),
+                        None,
+                    )
+                })?;
 
             // Build chat completions options
             let turn_metadata_header = parse_turn_metadata_header(turn_metadata_header);
@@ -859,12 +868,7 @@ impl ModelClientSession {
             };
 
             // Create the Chat Completions client with custom path if configured
-            let chat_path = self
-                .client
-                .state
-                .provider
-                .fallback_chat_path
-                .clone();
+            let chat_path = self.client.state.provider.fallback_chat_path.clone();
             let client = ChatCompletionsClient::new(
                 transport,
                 client_setup.api_provider,

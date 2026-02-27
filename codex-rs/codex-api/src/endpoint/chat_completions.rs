@@ -55,12 +55,7 @@ impl<T: HttpTransport, A: AuthProvider> ChatCompletionsClient<T, A> {
     /// * `provider` - API provider configuration
     /// * `auth` - Authentication provider
     /// * `chat_path` - Optional custom path for the Chat Completions endpoint
-    pub fn new(
-        transport: T,
-        provider: Provider,
-        auth: A,
-        chat_path: Option<String>,
-    ) -> Self {
+    pub fn new(transport: T, provider: Provider, auth: A, chat_path: Option<String>) -> Self {
         Self {
             session: EndpointSession::new(transport, provider, auth),
             sse_telemetry: None,
@@ -122,18 +117,12 @@ impl<T: HttpTransport, A: AuthProvider> ChatCompletionsClient<T, A> {
 
         let stream_response = self
             .session
-            .stream_with(
-                Method::POST,
-                path,
-                extra_headers,
-                Some(body),
-                |req| {
-                    req.headers.insert(
-                        http::header::ACCEPT,
-                        HeaderValue::from_static("text/event-stream"),
-                    );
-                },
-            )
+            .stream_with(Method::POST, path, extra_headers, Some(body), |req| {
+                req.headers.insert(
+                    http::header::ACCEPT,
+                    HeaderValue::from_static("text/event-stream"),
+                );
+            })
             .await?;
 
         Ok(spawn_chat_stream(
@@ -171,6 +160,18 @@ pub struct ChatCompletionsRequest {
     /// Stop sequences.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stop: Option<Vec<String>>,
+
+    /// Tools available to the model.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tools: Option<Vec<ChatCompletionsTool>>,
+
+    /// Tool selection mode.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_choice: Option<Value>,
+
+    /// Whether parallel tool calls are permitted.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parallel_tool_calls: Option<bool>,
 }
 
 const fn default_stream() -> bool {
@@ -184,7 +185,53 @@ pub struct ChatMessage {
     pub role: String,
 
     /// The content of the message.
-    pub content: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub content: Option<String>,
+
+    /// Tool calls emitted by an assistant message.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_calls: Option<Vec<ChatToolCall>>,
+
+    /// Identifier for tool-result messages.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_call_id: Option<String>,
+}
+
+/// A tool exposed in the Chat Completions request.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChatCompletionsTool {
+    #[serde(rename = "type")]
+    pub kind: String,
+    pub function: ChatToolFunction,
+}
+
+/// A tool call emitted by the model.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChatToolCall {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    #[serde(rename = "type", skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
+    pub function: ChatToolFunctionCall,
+}
+
+/// Function metadata for chat tools.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChatToolFunction {
+    pub name: String,
+    pub description: String,
+    pub parameters: Value,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub strict: Option<bool>,
+}
+
+/// Function call payload for a tool invocation.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChatToolFunctionCall {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub arguments: Option<String>,
 }
 
 /// Chat Completions API response (non-streaming).
@@ -284,6 +331,26 @@ pub struct ChatDelta {
     /// The content delta.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub content: Option<String>,
+
+    /// Tool call deltas.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_calls: Option<Vec<ChatToolCallDelta>>,
+
+    /// Legacy function_call delta payload.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub function_call: Option<ChatToolFunctionCall>,
+}
+
+/// Tool call delta emitted in streaming chat responses.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ChatToolCallDelta {
+    pub index: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    #[serde(rename = "type", skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub function: Option<ChatToolFunctionCall>,
 }
 
 #[cfg(test)]
@@ -297,17 +364,24 @@ mod tests {
             messages: vec![
                 ChatMessage {
                     role: "system".to_string(),
-                    content: "You are a helpful assistant.".to_string(),
+                    content: Some("You are a helpful assistant.".to_string()),
+                    tool_calls: None,
+                    tool_call_id: None,
                 },
                 ChatMessage {
                     role: "user".to_string(),
-                    content: "Hello!".to_string(),
+                    content: Some("Hello!".to_string()),
+                    tool_calls: None,
+                    tool_call_id: None,
                 },
             ],
             stream: true,
             temperature: Some(0.7),
             max_tokens: Some(100),
             stop: None,
+            tools: None,
+            tool_choice: None,
+            parallel_tool_calls: None,
         };
 
         let json = serde_json::to_string(&request).unwrap();

@@ -1,10 +1,10 @@
-# Codex TUI - WebSocket Streaming Integration
+# Codex TUI - WebSocket Integration
 
-Real-time streaming of Codex CLI output to external applications via WebSocket.
+Real-time streaming and prompt submission between Codex CLI and external applications via WebSocket.
 
 ## Overview
 
-The Codex TUI now supports WebSocket broadcasting, allowing external applications to receive LLM output in real-time as it's being generated. This is useful for:
+The Codex TUI now supports bidirectional WebSocket integration. External applications can send prompts and receive streamed output in real-time. This is useful for:
 - Building custom integrations with Codex
 - Monitoring Codex output remotely
 - Processing streaming output in external applications
@@ -51,13 +51,14 @@ cd /Users/wiggel/IntelliJIDEA/codex_clone/codex
 ```
 
 The WebSocket server listens on `ws://127.0.0.1:8765`.
+`codex exec` (headless) now starts the same websocket server and shuts it down when `exec` exits.
 
 ### 2. Run the Python Client
 
 In another terminal:
 
 ```bash
-cd codex-rs/tui
+cd python
 
 # Set up Python environment (first time only)
 uv venv .venv
@@ -67,41 +68,50 @@ uv pip install websockets
 .venv/bin/python python_websocket_client.py
 ```
 
+Or use the GUI client (send prompts + separate stream window):
+
+```bash
+.venv/bin/python codex_gui_client.py \
+  --binary ../codex-rs/target/debug/codex \
+  --profile HS_OG \
+  --mode ws
+```
+
 ### 3. Test It
 
-Type something in Codex - you should see the output appear in the Python client in real-time!
+Send a prompt from the GUI or `python_websocket_client.py` and watch the streamed answer in real-time.
 
 ## Python Client Usage
 
 ### Basic Usage
 
 ```bash
-python python_websocket_client.py
+python python/python_websocket_client.py
 ```
 
 ### Custom Server URI
 
 ```bash
-python python_websocket_client.py --uri ws://192.168.1.100:8765
+python python/python_websocket_client.py --uri ws://192.168.1.100:8765
 ```
 
 ### Disable Auto-Reconnect
 
 ```bash
-python python_websocket_client.py --no-reconnect
+python python/python_websocket_client.py --no-reconnect
 ```
 
 ### Custom Reconnect Delay
 
 ```bash
-python python_websocket_client.py --reconnect-delay 5
+python python/python_websocket_client.py --reconnect-delay 5
 ```
 
 ## API Reference
 
 ### WebSocket Message Format
 
-The server sends plain text messages. Each message contains a chunk of text (could be a single character or multiple characters).
+Server -> client: plain text chunks (single-character to larger blocks depending on provider/fallback behavior).
 
 Example:
 ```
@@ -118,6 +128,18 @@ l
 d
 !
 ```
+
+Client -> server:
+- Plain text prompt frame (entire frame is treated as prompt text)
+- JSON prompt payload:
+
+```json
+{"text":"Write a short Rust function and test."}
+```
+
+Interrupt commands:
+- Plain text `/interrupt`, `/stop`, `/cancel`
+- JSON command `{ "type": "interrupt" }` (also `stop`/`cancel`)
 
 ### Server Information
 
@@ -193,6 +215,14 @@ websocat ws://127.0.0.1:8765
 - Look for "WebSocket client connected from ..." message in Codex terminal
 - Make sure you're in an active conversation where Codex is generating output
 
+### Why streaming sometimes looks \"not fine-grained\"
+
+**Problem**: You may see larger chunk jumps instead of character-level/tiny deltas.
+
+**Reason**:
+- Some provider paths do not emit fine-grained deltas and only emit completion-sized chunks.
+- In that case, the websocket mirror forwards those larger chunks.
+
 ### Connection drops frequently
 
 **Problem**: WebSocket connection disconnects and reconnects often.
@@ -234,14 +264,18 @@ The Python client supports these options:
 ### File Structure
 
 ```
-codex-rs/tui/
-├── src/
-│   ├── chatwidget.rs         # WebSocket server implementation
-│   └── app.rs                # WebSocket enable call
-├── python_websocket_client.py  # Python client
-├── pyproject.toml            # Python dependencies
-├── requirements.txt          # Alternative Python deps
-└── README.md                 # This file
+repo-root/
+├── codex-rs/tui/
+│   ├── src/
+│   │   ├── chatwidget.rs      # WebSocket server implementation
+│   │   └── app.rs             # WebSocket enable call
+│   └── README.md              # This file
+└── python/
+    ├── codex_gui_client.py
+    ├── python_websocket_client.py
+    ├── pyproject.toml
+    ├── requirements.txt
+    └── README_WEBSOCKET.md
 ```
 
 ### Key Components
@@ -251,10 +285,15 @@ codex-rs/tui/
    - `enable_websocket_streaming()`: Spawns WebSocket server
    - `handle_streaming_delta()`: Sends text to WebSocket
 
-2. **Python Client** (`python_websocket_client.py`)
+2. **Python Client** (`python/python_websocket_client.py`)
    - Async WebSocket connection
    - Auto-reconnect logic
-   - Real-time character streaming
+   - Real-time chunk streaming
+
+3. **Python GUI Client** (`python/codex_gui_client.py`)
+   - Sends prompts via `codex exec`
+   - Separate stream window for `stdout/stderr/ws`
+   - Optional headless mode for scripted tests
 
 ## Future Enhancements
 
@@ -277,4 +316,4 @@ This WebSocket integration is part of the Codex project and follows the same lic
 For issues or questions:
 1. Check the troubleshooting section above
 2. Review `codex-rs/tui/src/chatwidget.rs` for server implementation details
-3. Review `python_websocket_client.py` for client implementation details
+3. Review `python/python_websocket_client.py` for client implementation details

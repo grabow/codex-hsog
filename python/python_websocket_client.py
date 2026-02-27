@@ -7,6 +7,7 @@ real-time streaming output from the Codex CLI.
 
 Usage:
     # Create virtual environment and install dependencies with uv
+    cd python
     uv venv codex_ws_client
     source codex_ws_client/bin/activate
     pip install websockets
@@ -15,6 +16,7 @@ Usage:
     python python_websocket_client.py
 
 Or with uv directly:
+    cd python
     uv run python_websocket_client.py
 """
 
@@ -43,7 +45,9 @@ async def connect_and_stream(
 
     while True:
         try:
-            async with websockets.connect(uri) as ws:
+            # codex-rs TUI websocket currently expects clients without compression extensions.
+            # Disable client ping timers because the TUI server does not read control frames.
+            async with websockets.connect(uri, compression=None, ping_interval=None) as ws:
                 print("✓ Connected to Codex WebSocket!")
                 print("=" * 50)
 
@@ -72,7 +76,7 @@ async def connect_and_stream(
                 if not reconnect:
                     break
 
-        except websockets.exceptions.ConnectionRefused:
+        except (ConnectionRefusedError, OSError):
             print(f"\n✗ Could not connect to {uri}")
             print(f"  Make sure Codex is running with WebSocket streaming enabled")
             print(f"  See codex-rs/tui/src/chatwidget.rs for details")
