@@ -403,6 +403,7 @@ class AppServerWsRepl:
         show_raw_json: bool,
         local_tool_routing: bool,
         local_tool_shell_mode: str,
+        local_tool_shell_init: str | None,
         gateway_token: str | None,
         gateway_provider_id: str | None,
         gateway_providers: list[dict[str, Any]] | None,
@@ -412,6 +413,9 @@ class AppServerWsRepl:
         self.model = model
         self.local_tool_routing = local_tool_routing
         self.local_tool_shell_mode = local_tool_shell_mode
+        self.local_tool_shell_init = (
+            local_tool_shell_init.strip() if isinstance(local_tool_shell_init, str) else None
+        )
         self.cwd = cwd or (os.getcwd() if local_tool_routing else None)
         self.model_provider = model_provider
         self.auto_approve = auto_approve
@@ -1036,9 +1040,15 @@ class AppServerWsRepl:
         cwd = self.cwd or os.getcwd()
         os_name = f"{platform.system()} {platform.release()}".strip()
         shell_mode = self.local_tool_shell_mode
+        init_hint = (
+            f"Client shell init command: {self.local_tool_shell_init}.\n"
+            if self.local_tool_shell_init
+            else ""
+        )
         return (
             "Execution routing: run terminal commands on the connected client machine, not the app-server host.\n"
             f"Client environment: os={os_name}, shell={shell_name}, cwd={cwd}, shell_mode={shell_mode}.\n"
+            f"{init_hint}"
             "Use exec_command and write_stdin for shell interactions."
         )
 
@@ -1149,6 +1159,40 @@ class AppServerWsRepl:
             login_shell=login,
         )
         self._persistent_shell_session_id = session.session_id
+
+        if self.local_tool_shell_init:
+            marker = f"__CODEX_INIT_{uuid.uuid4().hex}__"
+            payload = self._command_with_marker(
+                self.local_tool_shell_init,
+                workdir,
+                marker,
+                session.shell_kind,
+            )
+            stdin = session.process.stdin
+            if stdin is None or stdin.is_closing():
+                await self._finalize_local_session(session.session_id)
+                raise RuntimeError("persistent shell stdin is closed during init")
+            stdin.write(payload.encode("utf-8", errors="replace"))
+            with contextlib.suppress(Exception):
+                await stdin.drain()
+            session.active_marker = marker
+            session.active_started_at = asyncio.get_running_loop().time()
+
+            output, running, exit_code = await self._collect_persistent_command_output(
+                session=session,
+                yield_time_ms=10000,
+                max_output_tokens=2000,
+            )
+            if running:
+                await self._finalize_local_session(session.session_id)
+                raise RuntimeError("local shell init did not complete within 10 seconds")
+            if exit_code not in {None, 0}:
+                await self._finalize_local_session(session.session_id)
+                error_text = output.strip()
+                if error_text:
+                    raise RuntimeError(f"local shell init failed: {error_text}")
+                raise RuntimeError(f"local shell init failed with exit code {exit_code}")
+
         return session
 
     async def _collect_persistent_command_output(
@@ -1609,6 +1653,7 @@ async def run_repl(args: argparse.Namespace) -> int:
         show_raw_json=args.show_raw_json,
         local_tool_routing=args.local_tool_routing,
         local_tool_shell_mode=args.local_tool_shell_mode,
+        local_tool_shell_init=args.local_tool_shell_init,
         gateway_token=args.token,
         gateway_provider_id=args.provider_id,
         gateway_providers=load_gateway_providers(args.providers_json),
@@ -1742,6 +1787,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         choices=["subprocess", "persistent"],
         default="subprocess",
         help="local tool execution mode: one shell per command (subprocess) or one persistent shell",
+    )
+    parser.add_argument(
+        "--local-tool-shell-init",
+        default=None,
+        help="optional shell command executed once after starting a persistent local tool shell",
     )
     parser.add_argument(
         "--token",

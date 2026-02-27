@@ -42,6 +42,7 @@ class ParseArgsTests(unittest.TestCase):
         self.assertTrue(args.auto_approve)
         self.assertTrue(args.local_tool_routing)
         self.assertEqual(args.local_tool_shell_mode, "subprocess")
+        self.assertIsNone(args.local_tool_shell_init)
         self.assertFalse(args.show_raw_json)
         self.assertIsNone(args.token)
         self.assertIsNone(args.provider_id)
@@ -61,6 +62,8 @@ class ParseArgsTests(unittest.TestCase):
                 "thr_123",
                 "--local-tool-shell-mode",
                 "persistent",
+                "--local-tool-shell-init",
+                "source ~/.zshrc",
                 "--token",
                 "token-xyz",
                 "--provider-id",
@@ -75,6 +78,7 @@ class ParseArgsTests(unittest.TestCase):
         self.assertFalse(args.auto_approve)
         self.assertFalse(args.local_tool_routing)
         self.assertEqual(args.local_tool_shell_mode, "persistent")
+        self.assertEqual(args.local_tool_shell_init, "source ~/.zshrc")
         self.assertTrue(args.show_raw_json)
         self.assertEqual(args.thread_id, "thr_123")
         self.assertEqual(args.token, "token-xyz")
@@ -169,6 +173,7 @@ class LocalToolRoutingTests(unittest.IsolatedAsyncioTestCase):
             show_raw_json=False,
             local_tool_routing=True,
             local_tool_shell_mode="subprocess",
+            local_tool_shell_init=None,
             gateway_token=None,
             gateway_provider_id=None,
             gateway_providers=None,
@@ -194,6 +199,7 @@ class PersistentShellHelpersTests(unittest.TestCase):
             show_raw_json=False,
             local_tool_routing=True,
             local_tool_shell_mode="persistent",
+            local_tool_shell_init=None,
             gateway_token=None,
             gateway_provider_id=None,
             gateway_providers=None,
