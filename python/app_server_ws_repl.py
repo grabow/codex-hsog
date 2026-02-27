@@ -32,7 +32,10 @@ import termios
 import tty
 import uuid
 from typing import Any
+from urllib.parse import parse_qsl
+from urllib.parse import urlencode
 from urllib.parse import urlparse
+from urllib.parse import urlunparse
 
 try:
     import websockets
@@ -102,6 +105,43 @@ def format_ws_endpoint(uri: str) -> str:
     else:
         port = 80
     return f"{host}:{port}"
+
+
+def uri_with_token(uri: str, token: str) -> str:
+    parsed = urlparse(uri)
+    query_items = dict(parse_qsl(parsed.query, keep_blank_values=True))
+    query_items["token"] = token
+    return urlunparse(parsed._replace(query=urlencode(query_items)))
+
+
+def load_gateway_providers(raw: str | None) -> list[dict[str, Any]] | None:
+    if raw is None:
+        return None
+    value = raw.strip()
+    if not value:
+        return None
+
+    if value.startswith("@"):
+        file_path = Path(value[1:])
+        try:
+            value = file_path.read_text(encoding="utf-8")
+        except OSError as exc:
+            raise RuntimeError(f"could not read providers file `{file_path}`: {exc}") from exc
+
+    try:
+        decoded = json.loads(value)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"invalid --providers-json value: {exc}") from exc
+
+    if not isinstance(decoded, list):
+        raise RuntimeError("--providers-json must decode to a JSON list")
+
+    providers: list[dict[str, Any]] = []
+    for index, entry in enumerate(decoded):
+        if not isinstance(entry, dict):
+            raise RuntimeError(f"--providers-json entry at index {index} must be an object")
+        providers.append(entry)
+    return providers
 
 
 def format_stream_text(text: str) -> str:
@@ -353,6 +393,9 @@ class AppServerWsRepl:
         final_only: bool,
         show_raw_json: bool,
         local_tool_routing: bool,
+        gateway_token: str | None,
+        gateway_provider_id: str | None,
+        gateway_providers: list[dict[str, Any]] | None,
     ) -> None:
         self.uri = uri
         self.approval_policy = approval_policy
@@ -363,6 +406,11 @@ class AppServerWsRepl:
         self.auto_approve = auto_approve
         self.final_only = final_only
         self.show_raw_json = show_raw_json
+        self.gateway_token = gateway_token.strip() if isinstance(gateway_token, str) else None
+        self.gateway_provider_id = (
+            gateway_provider_id.strip() if isinstance(gateway_provider_id, str) else None
+        )
+        self.gateway_providers = gateway_providers or []
 
         self._ws: Any | None = None
         self._reader_task: asyncio.Task[None] | None = None
@@ -408,46 +456,73 @@ class AppServerWsRepl:
     async def connect(self) -> None:
         if websockets is None:
             raise RuntimeError("websockets dependency is missing; install `websockets`")
+        uri = self.uri
         try:
-            self._ws = await websockets.connect(
-                self.uri,
-                compression=None,
-                ping_interval=None,
-            )
+            connect_kwargs: dict[str, Any] = {
+                "compression": None,
+                "ping_interval": None,
+            }
+
+            if self.gateway_token:
+                auth_headers = {"Authorization": f"Bearer {self.gateway_token}"}
+                try:
+                    self._ws = await websockets.connect(
+                        uri,
+                        additional_headers=auth_headers,
+                        **connect_kwargs,
+                    )
+                except TypeError:
+                    try:
+                        self._ws = await websockets.connect(
+                            uri,
+                            extra_headers=auth_headers,
+                            **connect_kwargs,
+                        )
+                    except TypeError:
+                        uri = uri_with_token(uri, self.gateway_token)
+                        self._ws = await websockets.connect(uri, **connect_kwargs)
+            else:
+                self._ws = await websockets.connect(uri, **connect_kwargs)
         except OSError as exc:
             endpoint = format_ws_endpoint(self.uri)
             raise RuntimeError(f"Codex Server nicht erreichbar: {endpoint}") from exc
         self._reader_task = asyncio.create_task(self._reader_loop())
 
+        init_params: dict[str, Any] = {
+            "clientInfo": {
+                "name": "codex_python_ws_repl",
+                "title": "Codex Python WS REPL",
+                "version": "0.1.0",
+            },
+            "capabilities": {
+                "experimentalApi": True,
+                "optOutNotificationMethods": [
+                    "codex/event/agent_message_content_delta",
+                    "codex/event/agent_message_delta",
+                    "codex/event/item_started",
+                    "codex/event/item_completed",
+                    "codex/event/token_count",
+                    "codex/event/task_started",
+                    "codex/event/task_complete",
+                    "codex/event/user_message",
+                    "account/rateLimits/updated",
+                ],
+            },
+        }
+        if self.gateway_providers:
+            init_params["xGateway"] = {"providers": self.gateway_providers}
+
         init_result = await self.request(
             "initialize",
-            {
-                "clientInfo": {
-                    "name": "codex_python_ws_repl",
-                    "title": "Codex Python WS REPL",
-                    "version": "0.1.0",
-                },
-                "capabilities": {
-                    "experimentalApi": True,
-                    "optOutNotificationMethods": [
-                        "codex/event/agent_message_content_delta",
-                        "codex/event/agent_message_delta",
-                        "codex/event/item_started",
-                        "codex/event/item_completed",
-                        "codex/event/token_count",
-                        "codex/event/task_started",
-                        "codex/event/task_complete",
-                        "codex/event/user_message",
-                        "account/rateLimits/updated",
-                    ],
-                },
-            },
+            init_params,
         )
         user_agent = init_result.get("userAgent")
         if user_agent:
             print(f"[init] userAgent={user_agent}")
         if self.local_tool_routing:
             print("[local-tools] enabled (exec_command/write_stdin on client)")
+        if self.gateway_provider_id:
+            print(f"[gateway] default providerId={self.gateway_provider_id}")
 
         await self.notify("initialized", None)
 
@@ -521,6 +596,8 @@ class AppServerWsRepl:
                 "features.shell_tool": False,
             }
             params["developerInstructions"] = self._local_environment_developer_instructions()
+        if self.gateway_provider_id:
+            params["xGateway"] = {"providerId": self.gateway_provider_id}
 
         result = await self.request("thread/start", params)
         thread_id = result["thread"]["id"]
@@ -1254,6 +1331,9 @@ async def run_repl(args: argparse.Namespace) -> int:
         final_only=args.final_only,
         show_raw_json=args.show_raw_json,
         local_tool_routing=args.local_tool_routing,
+        gateway_token=args.token,
+        gateway_provider_id=args.provider_id,
+        gateway_providers=load_gateway_providers(args.providers_json),
     )
     await repl.connect()
     try:
@@ -1378,6 +1458,24 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         action=argparse.BooleanOptionalAction,
         default=True,
         help="route exec_command/write_stdin tool calls to this client machine",
+    )
+    parser.add_argument(
+        "--token",
+        default=None,
+        help="optional gateway bearer token",
+    )
+    parser.add_argument(
+        "--provider-id",
+        default=None,
+        help="optional xGateway providerId for thread/start",
+    )
+    parser.add_argument(
+        "--providers-json",
+        default=None,
+        help=(
+            "optional JSON array for initialize.params.xGateway.providers; "
+            "use @/path/to/providers.json to read from file"
+        ),
     )
     return parser.parse_args(argv)
 

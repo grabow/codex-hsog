@@ -27,7 +27,7 @@ cargo run -p codex-app-server-test-client -- \
 
 ```bash
 cd /path/to/codex
-python/.venv/bin/python python/app_server_ws_repl.py \
+uv run python/app_server_ws_repl.py \
   --url ws://<SERVER_IP>:4222 \
   --approval-policy never
 ```
@@ -40,6 +40,10 @@ Optional:
 - `--model-provider <name>` set provider override
 - `--cwd <path>` set working directory override
 - `--no-local-tool-routing` disable client-side routing for `exec_command`/`write_stdin`
+- `--token <value>` send bearer token when connecting to a gateway
+- `--providers-json '<json-array>'` send `initialize.params.xGateway.providers`
+- `--providers-json @/path/providers.json` read providers JSON from file
+- `--provider-id <id>` send `thread/start.params.xGateway.providerId`
 
 ## Interactive commands
 

@@ -26,7 +26,7 @@ WebSocket gateway for `codex app-server` with backend transport fixed to **stdio
 
 ```bash
 cd /path/to/codex
-python/.venv/bin/python python/app_server_stdio_gateway.py \
+uv run python/app_server_stdio_gateway.py \
   --users-config ./users.json \
   --codex-bin ./codex-rs/target/debug/codex \
   --listen-host 0.0.0.0 \
@@ -37,7 +37,7 @@ python/.venv/bin/python python/app_server_stdio_gateway.py \
 ### Start with TLS (`wss`)
 
 ```bash
-python/.venv/bin/python python/app_server_stdio_gateway.py \
+uv run python/app_server_stdio_gateway.py \
   --users-config ./users.json \
   --codex-bin ./codex-rs/target/debug/codex \
   --listen-host 0.0.0.0 \
