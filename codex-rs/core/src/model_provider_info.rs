@@ -6,9 +6,14 @@
 //!      key. These override or extend the defaults at runtime.
 
 use crate::auth::AuthMode;
+use crate::config::find_codex_home;
 use crate::error::EnvVarError;
 use codex_api::Provider as ApiProvider;
 use codex_api::provider::RetryConfig as ApiRetryConfig;
+use codex_secrets::SecretName;
+use codex_secrets::SecretScope;
+use codex_secrets::SecretsBackendKind;
+use codex_secrets::SecretsManager;
 use http::HeaderMap;
 use http::header::HeaderName;
 use http::header::HeaderValue;
@@ -17,6 +22,7 @@ use serde::Deserialize;
 use serde::Serialize;
 use std::collections::HashMap;
 use std::time::Duration;
+use tracing::warn;
 
 const DEFAULT_STREAM_IDLE_TIMEOUT_MS: u64 = 300_000;
 const DEFAULT_STREAM_MAX_RETRIES: u64 = 5;
@@ -190,16 +196,33 @@ impl ModelProviderInfo {
     pub fn api_key(&self) -> crate::error::Result<Option<String>> {
         match &self.env_key {
             Some(env_key) => {
-                let api_key = std::env::var(env_key)
-                    .ok()
-                    .filter(|v| !v.trim().is_empty())
-                    .ok_or_else(|| {
-                        crate::error::CodexErr::EnvVar(EnvVarError {
-                            var: env_key.clone(),
-                            instructions: self.env_key_instructions.clone(),
-                        })
-                    })?;
-                Ok(Some(api_key))
+                if let Some(api_key) = std::env::var(env_key).ok().filter(|v| !v.trim().is_empty())
+                {
+                    return Ok(Some(api_key));
+                }
+
+                if let Ok(codex_home) = find_codex_home()
+                    && let Ok(secret_name) = SecretName::new(env_key)
+                {
+                    let manager = SecretsManager::new(codex_home, SecretsBackendKind::Local);
+                    match manager.get(&SecretScope::Global, &secret_name) {
+                        Ok(Some(api_key)) if !api_key.trim().is_empty() => {
+                            return Ok(Some(api_key));
+                        }
+                        Ok(_) => {}
+                        Err(error) => {
+                            warn!(
+                                error = %error,
+                                "failed to load provider api key from local secret store"
+                            );
+                        }
+                    }
+                }
+
+                Err(crate::error::CodexErr::EnvVar(EnvVarError {
+                    var: env_key.clone(),
+                    instructions: self.env_key_instructions.clone(),
+                }))
             }
             None => Ok(None),
         }

@@ -305,6 +305,28 @@ pub(crate) enum AppEvent {
     /// Re-open the permissions presets popup.
     OpenPermissionsPopup,
 
+    /// Open the prompt for editing the active provider's base URL.
+    OpenActiveProviderUrlPrompt,
+
+    /// Persist a new base URL for the currently active provider.
+    SetActiveProviderBaseUrl {
+        value: String,
+    },
+
+    /// Clear the configured base URL override for the currently active provider.
+    ClearActiveProviderBaseUrl,
+
+    /// Open the prompt for editing the active provider's API key.
+    OpenActiveProviderApiKeyPrompt,
+
+    /// Persist a new API key for the currently active provider's `env_key`.
+    SetActiveProviderApiKey {
+        value: String,
+    },
+
+    /// Clear the stored API key for the currently active provider's `env_key`.
+    ClearActiveProviderApiKey,
+
     /// Open the branch picker option from the review popup.
     OpenReviewBranchPicker(PathBuf),
 

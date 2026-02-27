@@ -208,6 +208,7 @@ use crate::render::renderable::FlexRenderable;
 use crate::render::renderable::Renderable;
 use crate::render::renderable::RenderableExt;
 use crate::render::renderable::RenderableItem;
+use crate::secure_keys;
 use crate::slash_command::SlashCommand;
 use crate::status::RateLimitSnapshotDisplay;
 use crate::text_formatting::truncate_text;
@@ -3452,6 +3453,9 @@ impl ChatWidget {
             }
             SlashCommand::Statusline => {
                 self.open_status_line_setup();
+            }
+            SlashCommand::Keys => {
+                self.open_keys_menu();
             }
             SlashCommand::Ps => {
                 self.add_ps_output();
@@ -7074,6 +7078,153 @@ impl ChatWidget {
         self.bottom_pane.show_view(Box::new(view));
     }
 
+    fn open_keys_menu(&mut self) {
+        let profile_label = self.active_profile_label().to_string();
+        let provider_id = self.current_provider_id().to_string();
+        let provider_name = self.config.model_provider.name.clone();
+        let provider_url = self.current_provider_base_url_display();
+        let mut items = vec![
+            SelectionItem {
+                name: "Set provider URL".to_string(),
+                description: Some(format!("Current: {provider_url}")),
+                actions: vec![Box::new(|tx| {
+                    tx.send(AppEvent::OpenActiveProviderUrlPrompt);
+                })],
+                dismiss_on_select: false,
+                ..Default::default()
+            },
+            SelectionItem {
+                name: "Clear provider URL override".to_string(),
+                description: Some("Remove the configured base_url override.".to_string()),
+                actions: vec![Box::new(|tx| {
+                    tx.send(AppEvent::ClearActiveProviderBaseUrl);
+                })],
+                dismiss_on_select: true,
+                ..Default::default()
+            },
+        ];
+
+        if let Some(env_key) = self.current_provider_env_key() {
+            let key_status = match secure_keys::key_is_set(&self.config.codex_home, env_key) {
+                Ok(true) => format!("Current: stored in local secret store ({env_key})"),
+                Ok(false) => format!("Current: not set ({env_key})"),
+                Err(_) => format!("Secret name: {env_key}"),
+            };
+            items.extend([
+                SelectionItem {
+                    name: "Set provider API key".to_string(),
+                    description: Some(key_status.clone()),
+                    actions: vec![Box::new(|tx| {
+                        tx.send(AppEvent::OpenActiveProviderApiKeyPrompt);
+                    })],
+                    dismiss_on_select: false,
+                    ..Default::default()
+                },
+                SelectionItem {
+                    name: "Clear provider API key".to_string(),
+                    description: Some(key_status),
+                    actions: vec![Box::new(|tx| {
+                        tx.send(AppEvent::ClearActiveProviderApiKey);
+                    })],
+                    dismiss_on_select: true,
+                    ..Default::default()
+                },
+            ]);
+        } else {
+            items.push(SelectionItem {
+                name: "Provider API key is managed elsewhere".to_string(),
+                description: Some("This provider does not declare an env_key.".to_string()),
+                is_disabled: true,
+                ..Default::default()
+            });
+        }
+
+        self.bottom_pane.show_selection_view(SelectionViewParams {
+            title: Some("Manage provider settings".to_string()),
+            subtitle: Some(format!(
+                "Profile: {profile_label} | Provider: {provider_name} ({provider_id})"
+            )),
+            footer_hint: Some(standard_popup_hint_line()),
+            items,
+            ..Default::default()
+        });
+        self.request_redraw();
+    }
+
+    pub(crate) fn show_active_provider_url_prompt(&mut self) {
+        let tx = self.app_event_tx.clone();
+        let context_label = format!("Current: {}", self.current_provider_base_url_display());
+        let view = CustomPromptView::new(
+            "Set provider URL".to_string(),
+            "Type the provider base URL and press Enter".to_string(),
+            Some(context_label),
+            Box::new(move |value: String| {
+                tx.send(AppEvent::SetActiveProviderBaseUrl { value });
+            }),
+        );
+        self.bottom_pane.show_view(Box::new(view));
+    }
+
+    pub(crate) fn show_active_provider_api_key_prompt(&mut self) {
+        let Some(env_key) = self.current_provider_env_key() else {
+            self.add_error_message("The active provider does not define an env_key.".to_string());
+            return;
+        };
+        let tx = self.app_event_tx.clone();
+        let view = CustomPromptView::new(
+            "Set provider API key".to_string(),
+            "Type the API key and press Enter".to_string(),
+            Some(format!("Secret name: {env_key}")),
+            Box::new(move |value: String| {
+                tx.send(AppEvent::SetActiveProviderApiKey { value });
+            }),
+        );
+        self.bottom_pane.show_view(Box::new(view));
+    }
+
+    pub(crate) fn set_active_provider_api_key_value(&mut self, value: &str) {
+        let Some(env_key) = self.current_provider_env_key() else {
+            self.add_error_message("The active provider does not define an env_key.".to_string());
+            return;
+        };
+        let trimmed = value.trim();
+        match secure_keys::set_key(&self.config.codex_home, env_key, trimmed) {
+            Ok(()) => {
+                self.add_info_message(
+                    format!(
+                        "Stored API key for {env_key} ({})",
+                        self.current_provider_id()
+                    ),
+                    None,
+                );
+            }
+            Err(err) => {
+                self.add_error_message(format!("Failed to store API key for {env_key}: {err}"));
+            }
+        }
+    }
+
+    pub(crate) fn clear_active_provider_api_key(&mut self) {
+        let Some(env_key) = self.current_provider_env_key() else {
+            self.add_error_message("The active provider does not define an env_key.".to_string());
+            return;
+        };
+        match secure_keys::clear_key(&self.config.codex_home, env_key) {
+            Ok(_) => {
+                self.add_info_message(
+                    format!(
+                        "Cleared stored API key for {env_key} ({})",
+                        self.current_provider_id()
+                    ),
+                    None,
+                );
+            }
+            Err(err) => {
+                self.add_error_message(format!("Failed to clear API key for {env_key}: {err}"));
+            }
+        }
+    }
+
     pub(crate) fn token_usage(&self) -> TokenUsage {
         self.token_info
             .as_ref()
@@ -7135,8 +7286,40 @@ impl ChatWidget {
         &self.config
     }
 
+    pub(crate) fn replace_config(&mut self, config: Config) {
+        self.config = config;
+    }
+
+    pub(crate) fn set_active_provider_base_url(&mut self, base_url: Option<String>) {
+        let provider_id = self.current_provider_id().to_string();
+        self.config.model_provider.base_url = base_url.clone();
+        if let Some(provider) = self.config.model_providers.get_mut(&provider_id) {
+            provider.base_url = base_url;
+        }
+    }
+
     pub(crate) fn clear_token_usage(&mut self) {
         self.token_info = None;
+    }
+
+    fn active_profile_label(&self) -> &str {
+        self.config.active_profile.as_deref().unwrap_or("default")
+    }
+
+    fn current_provider_id(&self) -> &str {
+        self.config.model_provider_id.as_str()
+    }
+
+    fn current_provider_env_key(&self) -> Option<&str> {
+        self.config.model_provider.env_key.as_deref()
+    }
+
+    fn current_provider_base_url_display(&self) -> String {
+        self.config
+            .model_provider
+            .base_url
+            .clone()
+            .unwrap_or_else(|| "provider default".to_string())
     }
 
     fn as_renderable(&self) -> RenderableItem<'_> {

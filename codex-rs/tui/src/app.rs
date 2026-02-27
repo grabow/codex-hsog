@@ -650,6 +650,71 @@ impl App {
         Ok(())
     }
 
+    async fn update_active_provider_base_url(&mut self, base_url: Option<String>) {
+        let provider_id = self.config.model_provider_id.clone();
+        let edit = match base_url.clone() {
+            Some(url) => ConfigEdit::SetPath {
+                segments: vec![
+                    "model_providers".to_string(),
+                    provider_id.clone(),
+                    "base_url".to_string(),
+                ],
+                value: url.into(),
+            },
+            None => ConfigEdit::ClearPath {
+                segments: vec![
+                    "model_providers".to_string(),
+                    provider_id.clone(),
+                    "base_url".to_string(),
+                ],
+            },
+        };
+
+        match ConfigEditsBuilder::new(&self.config.codex_home)
+            .with_edits([edit])
+            .apply()
+            .await
+        {
+            Ok(()) => {
+                if let Err(err) = self.refresh_in_memory_config_from_disk().await {
+                    tracing::warn!(
+                        error = %err,
+                        "failed to refresh config after provider url update"
+                    );
+                    self.config.model_provider.base_url = base_url.clone();
+                    if let Some(provider) = self.config.model_providers.get_mut(&provider_id) {
+                        provider.base_url = base_url.clone();
+                    }
+                    self.chat_widget
+                        .set_active_provider_base_url(base_url.clone());
+                } else {
+                    self.chat_widget.replace_config(self.config.clone());
+                }
+
+                let profile_label = self.active_profile.as_deref().unwrap_or("default");
+                let message = match base_url {
+                    Some(url) => {
+                        format!(
+                            "Saved provider URL for {provider_id} (active profile: {profile_label}) to {url}"
+                        )
+                    }
+                    None => {
+                        format!(
+                            "Cleared provider URL override for {provider_id} (active profile: {profile_label})"
+                        )
+                    }
+                };
+                self.chat_widget.add_info_message(message, None);
+                self.chat_widget.submit_op(Op::ReloadUserConfig);
+            }
+            Err(err) => {
+                self.chat_widget.add_error_message(format!(
+                    "Failed to save provider URL for {provider_id}: {err}"
+                ));
+            }
+        }
+    }
+
     fn apply_runtime_policy_overrides(&mut self, config: &mut Config) {
         if let Some(policy) = self.runtime_approval_policy_override.as_ref()
             && let Err(err) = config.permissions.approval_policy.set(*policy)
@@ -2414,6 +2479,25 @@ impl App {
             }
             AppEvent::OpenPermissionsPopup => {
                 self.chat_widget.open_permissions_popup();
+            }
+            AppEvent::OpenActiveProviderUrlPrompt => {
+                self.chat_widget.show_active_provider_url_prompt();
+            }
+            AppEvent::SetActiveProviderBaseUrl { value } => {
+                self.update_active_provider_base_url(Some(value)).await;
+            }
+            AppEvent::ClearActiveProviderBaseUrl => {
+                self.update_active_provider_base_url(None).await;
+            }
+            AppEvent::OpenActiveProviderApiKeyPrompt => {
+                self.chat_widget.show_active_provider_api_key_prompt();
+            }
+            AppEvent::SetActiveProviderApiKey { value } => {
+                self.chat_widget
+                    .set_active_provider_api_key_value(value.as_str());
+            }
+            AppEvent::ClearActiveProviderApiKey => {
+                self.chat_widget.clear_active_provider_api_key();
             }
             AppEvent::OpenReviewBranchPicker(cwd) => {
                 self.chat_widget.show_review_branch_picker(&cwd).await;

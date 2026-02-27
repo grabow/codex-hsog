@@ -1,0 +1,14 @@
+---
+source: tui/src/chatwidget/tests.rs
+assertion_line: 5252
+expression: popup
+---
+  Manage provider settings
+  Profile: HS_OG | Provider: HSOG Gateway (hsog-gateway)
+
+› 1. Set provider URL             Current: https://gateway.example/v1
+  2. Clear provider URL override  Remove the configured base_url override.
+  3. Set provider API key         Secret name: hsog_gateway_key
+  4. Clear provider API key       Secret name: hsog_gateway_key
+
+  Press enter to confirm or esc to go back

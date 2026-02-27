@@ -5236,6 +5236,23 @@ async fn feedback_upload_consent_popup_snapshot() {
 }
 
 #[tokio::test]
+async fn keys_popup_snapshot() {
+    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(None).await;
+    let temp_dir = tempdir().expect("tempdir");
+    chat.config.codex_home = temp_dir.path().to_path_buf();
+    chat.config.active_profile = Some("HS_OG".to_string());
+    chat.config.model_provider_id = "hsog-gateway".to_string();
+    chat.config.model_provider.name = "HSOG Gateway".to_string();
+    chat.config.model_provider.base_url = Some("https://gateway.example/v1".to_string());
+    chat.config.model_provider.env_key = Some("hsog_gateway_key".to_string());
+
+    chat.dispatch_command(SlashCommand::Keys);
+
+    let popup = render_bottom_popup(&chat, 80);
+    assert_snapshot!("keys_popup", popup);
+}
+
+#[tokio::test]
 async fn reasoning_popup_escape_returns_to_model_popup() {
     let (mut chat, _rx, _op_rx) = make_chatwidget_manual(Some("gpt-5.1-codex-max")).await;
     chat.thread_id = Some(ThreadId::new());
