@@ -262,6 +262,37 @@ class PersistentShellHelpersTests(unittest.TestCase):
             env = client._local_tool_process_env()  # noqa: SLF001
         self.assertEqual(env["PATH"], "/usr/local/bin:/usr/bin")
 
+    def test_rewrite_python_command_uses_uv_project_when_pyproject_exists(self) -> None:
+        client = self._client()
+        with tempfile.TemporaryDirectory() as tmp:
+            workdir = tmp
+            with open(f"{workdir}/pyproject.toml", "w", encoding="utf-8") as handle:
+                handle.write("[project]\nname='x'\nversion='0.1.0'\n")
+            rewritten = client._rewrite_python_command_with_uv("python script.py", workdir)  # noqa: SLF001
+        self.assertIn("uv run --project", rewritten)
+        self.assertTrue(rewritten.endswith("python script.py"))
+
+    def test_rewrite_python_command_with_python_c_semicolon(self) -> None:
+        client = self._client()
+        with tempfile.TemporaryDirectory() as tmp:
+            workdir = tmp
+            with open(f"{workdir}/pyproject.toml", "w", encoding="utf-8") as handle:
+                handle.write("[project]\nname='x'\nversion='0.1.0'\n")
+            rewritten = client._rewrite_python_command_with_uv(  # noqa: SLF001
+                'python -c "import sys; print(sys.executable)"',
+                workdir,
+            )
+        self.assertIn("uv run --project", rewritten)
+
+    def test_rewrite_python_command_keeps_explicit_uv_run(self) -> None:
+        client = self._client()
+        with tempfile.TemporaryDirectory() as tmp:
+            rewritten = client._rewrite_python_command_with_uv(  # noqa: SLF001
+                "uv run python script.py",
+                tmp,
+            )
+        self.assertEqual(rewritten, "uv run python script.py")
+
 
 if __name__ == "__main__":
     unittest.main()

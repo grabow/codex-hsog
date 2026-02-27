@@ -1098,6 +1098,35 @@ class AppServerWsRepl:
         arg = "-lc" if login else "-c"
         return [shell_path, arg, cmd]
 
+    def _rewrite_python_command_with_uv(self, cmd: str, workdir: str) -> str:
+        stripped = cmd.strip()
+        if not stripped:
+            return cmd
+        if "&&" in stripped or "||" in stripped or "\n" in stripped:
+            return cmd
+
+        try:
+            parts = shlex.split(stripped)
+        except ValueError:
+            return cmd
+        if not parts:
+            return cmd
+
+        first = parts[0]
+        first_lower = first.lower()
+        if first_lower == "uv" and len(parts) >= 2 and parts[1].lower() == "run":
+            return cmd
+
+        executable = Path(first).name.lower()
+        if executable not in {"python", "python3", "pip", "pip3"}:
+            return cmd
+        if first != executable:
+            return cmd
+        if not Path(workdir, "pyproject.toml").exists():
+            return cmd
+
+        return f"uv run --project {shlex.quote(workdir)} {cmd}"
+
     def _shell_kind_for_path(self, shell_path: str) -> str:
         lower_name = Path(shell_path).name.lower()
         if "powershell" in lower_name or lower_name == "pwsh":
@@ -1377,6 +1406,7 @@ class AppServerWsRepl:
             if isinstance(workdir_value, str) and workdir_value.strip()
             else (self.cwd or os.getcwd())
         )
+        cmd_to_run = self._rewrite_python_command_with_uv(cmd, workdir)
         shell = arguments.get("shell")
         shell_value = shell if isinstance(shell, str) and shell.strip() else None
         login = bool(arguments.get("login", True))
@@ -1403,7 +1433,7 @@ class AppServerWsRepl:
                         f"Previous command still running in session_id {session.session_id}; use write_stdin."
                     )
                 marker = f"__CODEX_EXIT_{uuid.uuid4().hex}__"
-                payload = self._command_with_marker(cmd, workdir, marker, session.shell_kind)
+                payload = self._command_with_marker(cmd_to_run, workdir, marker, session.shell_kind)
                 stdin = session.process.stdin
                 if stdin is None or stdin.is_closing():
                     return self._dynamic_tool_failure("persistent shell stdin is closed")
@@ -1432,7 +1462,7 @@ class AppServerWsRepl:
             )
             return self._dynamic_tool_success(text)
 
-        argv = self._derive_exec_argv(cmd, shell_value, login)
+        argv = self._derive_exec_argv(cmd_to_run, shell_value, login)
         process: asyncio.subprocess.Process
         try:
             process = await asyncio.create_subprocess_exec(
