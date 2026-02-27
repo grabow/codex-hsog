@@ -1079,8 +1079,9 @@ class AppServerWsRepl:
             return argv
         if shell_kind == "cmd":
             return [shell_path, "/q", "/k"]
-        arg = "-il" if login else "-i"
-        return [shell_path, arg]
+        if login:
+            return [shell_path, "-l"]
+        return [shell_path]
 
     def _command_with_marker(
         self,

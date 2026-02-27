@@ -205,6 +205,11 @@ class PersistentShellHelpersTests(unittest.TestCase):
         self.assertEqual(client._shell_kind_for_path("pwsh"), "powershell")  # noqa: SLF001
         self.assertEqual(client._shell_kind_for_path("cmd.exe"), "cmd")  # noqa: SLF001
 
+    def test_persistent_shell_argv_posix_uses_non_interactive_login(self) -> None:
+        client = self._client()
+        self.assertEqual(client._persistent_shell_argv("/bin/zsh", True), ["/bin/zsh", "-l"])  # noqa: SLF001
+        self.assertEqual(client._persistent_shell_argv("/bin/zsh", False), ["/bin/zsh"])  # noqa: SLF001
+
     def test_posix_command_with_marker_wraps_cd_and_printf(self) -> None:
         client = self._client()
         command = client._command_with_marker("echo hi", "/tmp/test dir", "M", "posix")  # noqa: SLF001
