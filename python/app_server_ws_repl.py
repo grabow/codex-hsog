@@ -21,6 +21,7 @@ import asyncio
 import atexit
 import contextlib
 from dataclasses import dataclass
+from dataclasses import field
 import json
 import os
 from pathlib import Path
@@ -58,6 +59,14 @@ class LocalExecSession:
     completion_event: asyncio.Event
     reader_tasks: list[asyncio.Task[None]]
     waiter_task: asyncio.Task[None]
+    persistent_shell: bool = False
+    shell_path: str | None = None
+    shell_kind: str = "posix"
+    login_shell: bool = True
+    pending_buffer: str = ""
+    active_marker: str | None = None
+    active_started_at: float | None = None
+    command_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 
 
 def parse_repl_command(line: str) -> ReplCommand:
@@ -393,6 +402,7 @@ class AppServerWsRepl:
         final_only: bool,
         show_raw_json: bool,
         local_tool_routing: bool,
+        local_tool_shell_mode: str,
         gateway_token: str | None,
         gateway_provider_id: str | None,
         gateway_providers: list[dict[str, Any]] | None,
@@ -401,6 +411,7 @@ class AppServerWsRepl:
         self.approval_policy = approval_policy
         self.model = model
         self.local_tool_routing = local_tool_routing
+        self.local_tool_shell_mode = local_tool_shell_mode
         self.cwd = cwd or (os.getcwd() if local_tool_routing else None)
         self.model_provider = model_provider
         self.auto_approve = auto_approve
@@ -427,6 +438,7 @@ class AppServerWsRepl:
         self.active_turn_id: str | None = None
         self._next_local_session_id = 1
         self._local_exec_sessions: dict[int, LocalExecSession] = {}
+        self._persistent_shell_session_id: int | None = None
 
     def _clear_ephemeral_status(self) -> None:
         if self._ephemeral_status_active:
@@ -520,7 +532,9 @@ class AppServerWsRepl:
         if user_agent:
             print(f"[init] userAgent={user_agent}")
         if self.local_tool_routing:
-            print("[local-tools] enabled (exec_command/write_stdin on client)")
+            print(
+                f"[local-tools] enabled (exec_command/write_stdin on client, mode={self.local_tool_shell_mode})"
+            )
         if self.gateway_provider_id:
             print(f"[gateway] default providerId={self.gateway_provider_id}")
 
@@ -581,6 +595,9 @@ class AppServerWsRepl:
         await self._ws.send(json.dumps(payload, ensure_ascii=False))
 
     async def start_thread(self) -> str:
+        if self.local_tool_routing and self.local_tool_shell_mode == "persistent":
+            await self._close_persistent_shell_if_any()
+
         params: dict[str, Any] = {
             "approvalPolicy": self.approval_policy,
         }
@@ -605,6 +622,9 @@ class AppServerWsRepl:
         return thread_id
 
     async def resume_thread(self, thread_id: str) -> str:
+        if self.local_tool_routing and self.local_tool_shell_mode == "persistent":
+            await self._close_persistent_shell_if_any()
+
         params: dict[str, Any] = {
             "threadId": thread_id,
             "approvalPolicy": self.approval_policy,
@@ -1015,9 +1035,10 @@ class AppServerWsRepl:
         shell_name = Path(self._default_shell_path()).name
         cwd = self.cwd or os.getcwd()
         os_name = f"{platform.system()} {platform.release()}".strip()
+        shell_mode = self.local_tool_shell_mode
         return (
             "Execution routing: run terminal commands on the connected client machine, not the app-server host.\n"
-            f"Client environment: os={os_name}, shell={shell_name}, cwd={cwd}.\n"
+            f"Client environment: os={os_name}, shell={shell_name}, cwd={cwd}, shell_mode={shell_mode}.\n"
             "Use exec_command and write_stdin for shell interactions."
         )
 
@@ -1039,6 +1060,167 @@ class AppServerWsRepl:
             return [shell_path, "/c", cmd]
         arg = "-lc" if login else "-c"
         return [shell_path, arg, cmd]
+
+    def _shell_kind_for_path(self, shell_path: str) -> str:
+        lower_name = Path(shell_path).name.lower()
+        if "powershell" in lower_name or lower_name == "pwsh":
+            return "powershell"
+        if lower_name in {"cmd", "cmd.exe"}:
+            return "cmd"
+        return "posix"
+
+    def _persistent_shell_argv(self, shell_path: str, login: bool) -> list[str]:
+        shell_kind = self._shell_kind_for_path(shell_path)
+        if shell_kind == "powershell":
+            argv = [shell_path, "-NoLogo"]
+            if not login:
+                argv.append("-NoProfile")
+            argv.append("-NoExit")
+            return argv
+        if shell_kind == "cmd":
+            return [shell_path, "/q", "/k"]
+        arg = "-il" if login else "-i"
+        return [shell_path, arg]
+
+    def _command_with_marker(
+        self,
+        cmd: str,
+        workdir: str,
+        marker: str,
+        shell_kind: str,
+    ) -> str:
+        if shell_kind == "powershell":
+            escaped_workdir = workdir.replace("'", "''")
+            return (
+                f"Set-Location -LiteralPath '{escaped_workdir}'\n"
+                f"{cmd}\n"
+                f"$__codex_exit = $LASTEXITCODE\n"
+                f"Write-Output \"{marker}:$__codex_exit\"\n"
+            )
+        if shell_kind == "cmd":
+            escaped_workdir = workdir.replace('"', '\\"')
+            return (
+                f"cd /d \"{escaped_workdir}\"\r\n"
+                f"{cmd}\r\n"
+                f"echo {marker}:%errorlevel%\r\n"
+            )
+
+        escaped_workdir = shlex.quote(workdir)
+        return (
+            f"cd {escaped_workdir}\n"
+            f"{cmd}\n"
+            f"printf '{marker}:%s\\n' \"$?\"\n"
+        )
+
+    async def _ensure_persistent_shell_session(
+        self,
+        workdir: str,
+        shell: str | None,
+        login: bool,
+    ) -> LocalExecSession:
+        if self._persistent_shell_session_id is not None:
+            existing = self._local_exec_sessions.get(self._persistent_shell_session_id)
+            if existing is not None and existing.process.returncode is None:
+                return existing
+            self._persistent_shell_session_id = None
+
+        shell_path = shell or self._default_shell_path()
+        shell_kind = self._shell_kind_for_path(shell_path)
+        argv = self._persistent_shell_argv(shell_path, login)
+
+        process: asyncio.subprocess.Process
+        try:
+            process = await asyncio.create_subprocess_exec(
+                *argv,
+                cwd=workdir,
+                stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+        except Exception as exc:
+            raise RuntimeError(f"persistent shell failed to start: {exc}") from exc
+
+        session = self._register_local_session(
+            process,
+            persistent_shell=True,
+            shell_path=shell_path,
+            shell_kind=shell_kind,
+            login_shell=login,
+        )
+        self._persistent_shell_session_id = session.session_id
+        return session
+
+    async def _collect_persistent_command_output(
+        self,
+        session: LocalExecSession,
+        yield_time_ms: int,
+        max_output_tokens: int | None,
+    ) -> tuple[str, bool, int | None]:
+        marker = session.active_marker
+        if marker is None:
+            output, _ = await self._collect_session_output(
+                session=session,
+                yield_time_ms=yield_time_ms,
+                max_output_tokens=max_output_tokens,
+            )
+            running = session.process.returncode is None
+            return output, running, session.process.returncode
+
+        marker_regex = re.compile(re.escape(f"{marker}:") + r"(-?\d+)\r?\n")
+        timeout_seconds = max(yield_time_ms, 0) / 1000.0
+        deadline = asyncio.get_running_loop().time() + timeout_seconds
+        chunks: list[str] = []
+        exit_code: int | None = None
+
+        while True:
+            match = marker_regex.search(session.pending_buffer)
+            if match:
+                chunks.append(session.pending_buffer[: match.start()])
+                session.pending_buffer = session.pending_buffer[match.end() :]
+                exit_code = int(match.group(1))
+                session.active_marker = None
+                session.active_started_at = None
+                break
+
+            if session.process.returncode is not None and session.output_queue.empty():
+                chunks.append(session.pending_buffer)
+                session.pending_buffer = ""
+                session.active_marker = None
+                session.active_started_at = None
+                exit_code = session.process.returncode
+                break
+
+            remaining = deadline - asyncio.get_running_loop().time()
+            if remaining <= 0:
+                break
+
+            try:
+                chunk = await asyncio.wait_for(session.output_queue.get(), timeout=remaining)
+            except TimeoutError:
+                break
+            session.pending_buffer += chunk
+
+            while True:
+                try:
+                    session.pending_buffer += session.output_queue.get_nowait()
+                except asyncio.QueueEmpty:
+                    break
+
+            if len(session.pending_buffer) > 8192:
+                chunks.append(session.pending_buffer[:-8192])
+                session.pending_buffer = session.pending_buffer[-8192:]
+
+        output = "".join(chunks)
+        original_token_count = max(1, len(output) // 4) if output else 0
+        if max_output_tokens is not None and max_output_tokens >= 0:
+            max_chars = max_output_tokens * 4
+            if len(output) > max_chars:
+                output = output[:max_chars]
+
+        running = exit_code is None and session.process.returncode is None
+        if running:
+            return output, True, None
+        return output, False, exit_code
 
     async def _handle_dynamic_tool_call(self, params: dict[str, Any]) -> dict[str, Any]:
         if not self.local_tool_routing:
@@ -1096,6 +1278,51 @@ class AppServerWsRepl:
             int(max_output_tokens_raw) if isinstance(max_output_tokens_raw, (int, float)) else None
         )
 
+        if self.local_tool_shell_mode == "persistent":
+            try:
+                session = await self._ensure_persistent_shell_session(
+                    workdir=workdir,
+                    shell=shell_value,
+                    login=login,
+                )
+            except RuntimeError as exc:
+                return self._dynamic_tool_failure(str(exc))
+
+            async with session.command_lock:
+                if session.active_marker is not None:
+                    return self._dynamic_tool_failure(
+                        f"Previous command still running in session_id {session.session_id}; use write_stdin."
+                    )
+                marker = f"__CODEX_EXIT_{uuid.uuid4().hex}__"
+                payload = self._command_with_marker(cmd, workdir, marker, session.shell_kind)
+                stdin = session.process.stdin
+                if stdin is None or stdin.is_closing():
+                    return self._dynamic_tool_failure("persistent shell stdin is closed")
+                stdin.write(payload.encode("utf-8", errors="replace"))
+                with contextlib.suppress(Exception):
+                    await stdin.drain()
+                session.active_marker = marker
+                session.active_started_at = asyncio.get_running_loop().time()
+                command_started_at = session.active_started_at
+
+                output, running, exit_code = await self._collect_persistent_command_output(
+                    session=session,
+                    yield_time_ms=yield_time_ms,
+                    max_output_tokens=max_output_tokens,
+                )
+                if not running and session.process.returncode is not None:
+                    await self._finalize_local_session(session.session_id)
+
+            text = self._format_dynamic_exec_output(
+                session=session,
+                output=output,
+                include_session_id=running,
+                tty_requested=tty_requested,
+                explicit_exit_code=exit_code,
+                started_at_override=command_started_at,
+            )
+            return self._dynamic_tool_success(text)
+
         argv = self._derive_exec_argv(cmd, shell_value, login)
         process: asyncio.subprocess.Process
         try:
@@ -1116,7 +1343,7 @@ class AppServerWsRepl:
             max_output_tokens=max_output_tokens,
         )
         running = not session.completion_event.is_set()
-        if not running:
+        if not running and (not session.persistent_shell or session.process.returncode is not None):
             await self._finalize_local_session(session.session_id)
 
         text = self._format_dynamic_exec_output(
@@ -1124,6 +1351,8 @@ class AppServerWsRepl:
             output=output,
             include_session_id=running,
             tty_requested=tty_requested,
+            explicit_exit_code=None,
+            started_at_override=None,
         )
         return self._dynamic_tool_success(text)
 
@@ -1151,13 +1380,22 @@ class AppServerWsRepl:
             with contextlib.suppress(Exception):
                 await stdin.drain()
 
-        output, _original_token_count = await self._collect_session_output(
-            session=session,
-            yield_time_ms=yield_time_ms,
-            max_output_tokens=max_output_tokens,
-        )
-        running = not session.completion_event.is_set()
-        if not running:
+        if session.persistent_shell:
+            output, running, exit_code = await self._collect_persistent_command_output(
+                session=session,
+                yield_time_ms=yield_time_ms,
+                max_output_tokens=max_output_tokens,
+            )
+        else:
+            output, _ = await self._collect_session_output(
+                session=session,
+                yield_time_ms=yield_time_ms,
+                max_output_tokens=max_output_tokens,
+            )
+            running = not session.completion_event.is_set()
+            exit_code = None
+
+        if not running and (not session.persistent_shell or session.process.returncode is not None):
             await self._finalize_local_session(session.session_id)
 
         text = self._format_dynamic_exec_output(
@@ -1165,10 +1403,19 @@ class AppServerWsRepl:
             output=output,
             include_session_id=running,
             tty_requested=False,
+            explicit_exit_code=exit_code,
+            started_at_override=None,
         )
         return self._dynamic_tool_success(text)
 
-    def _register_local_session(self, process: asyncio.subprocess.Process) -> LocalExecSession:
+    def _register_local_session(
+        self,
+        process: asyncio.subprocess.Process,
+        persistent_shell: bool = False,
+        shell_path: str | None = None,
+        shell_kind: str = "posix",
+        login_shell: bool = True,
+    ) -> LocalExecSession:
         session_id = self._next_local_session_id
         self._next_local_session_id += 1
 
@@ -1204,6 +1451,10 @@ class AppServerWsRepl:
             completion_event=completion_event,
             reader_tasks=reader_tasks,
             waiter_task=waiter_task,
+            persistent_shell=persistent_shell,
+            shell_path=shell_path,
+            shell_kind=shell_kind,
+            login_shell=login_shell,
         )
         self._local_exec_sessions[session_id] = session
         return session
@@ -1250,8 +1501,11 @@ class AppServerWsRepl:
         output: str,
         include_session_id: bool,
         tty_requested: bool,
+        explicit_exit_code: int | None,
+        started_at_override: float | None,
     ) -> str:
-        wall_time_seconds = asyncio.get_running_loop().time() - session.started_at
+        started_at = started_at_override or session.started_at
+        wall_time_seconds = asyncio.get_running_loop().time() - started_at
         sections = [
             f"Chunk ID: local-{session.session_id}-{uuid.uuid4().hex[:6]}",
             f"Wall time: {wall_time_seconds:.4f} seconds",
@@ -1259,7 +1513,7 @@ class AppServerWsRepl:
         if include_session_id:
             sections.append(f"Process running with session ID {session.session_id}")
         else:
-            exit_code = session.process.returncode
+            exit_code = explicit_exit_code if explicit_exit_code is not None else session.process.returncode
             if exit_code is not None:
                 sections.append(f"Process exited with code {exit_code}")
         if tty_requested:
@@ -1272,6 +1526,8 @@ class AppServerWsRepl:
         session = self._local_exec_sessions.pop(session_id, None)
         if session is None:
             return
+        if self._persistent_shell_session_id == session_id:
+            self._persistent_shell_session_id = None
 
         for task in session.reader_tasks:
             task.cancel()
@@ -1297,6 +1553,26 @@ class AppServerWsRepl:
                     with contextlib.suppress(Exception):
                         await session.process.wait()
             await self._finalize_local_session(session_id)
+
+    async def _close_persistent_shell_if_any(self) -> None:
+        session_id = self._persistent_shell_session_id
+        if session_id is None:
+            return
+        session = self._local_exec_sessions.get(session_id)
+        if session is None:
+            self._persistent_shell_session_id = None
+            return
+        if session.process.returncode is None:
+            with contextlib.suppress(ProcessLookupError):
+                session.process.terminate()
+            try:
+                await asyncio.wait_for(session.process.wait(), timeout=1.0)
+            except TimeoutError:
+                with contextlib.suppress(ProcessLookupError):
+                    session.process.kill()
+                with contextlib.suppress(Exception):
+                    await session.process.wait()
+        await self._finalize_local_session(session_id)
 
 
 def print_help() -> None:
@@ -1331,6 +1607,7 @@ async def run_repl(args: argparse.Namespace) -> int:
         final_only=args.final_only,
         show_raw_json=args.show_raw_json,
         local_tool_routing=args.local_tool_routing,
+        local_tool_shell_mode=args.local_tool_shell_mode,
         gateway_token=args.token,
         gateway_provider_id=args.provider_id,
         gateway_providers=load_gateway_providers(args.providers_json),
@@ -1458,6 +1735,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         action=argparse.BooleanOptionalAction,
         default=True,
         help="route exec_command/write_stdin tool calls to this client machine",
+    )
+    parser.add_argument(
+        "--local-tool-shell-mode",
+        choices=["subprocess", "persistent"],
+        default="subprocess",
+        help="local tool execution mode: one shell per command (subprocess) or one persistent shell",
     )
     parser.add_argument(
         "--token",

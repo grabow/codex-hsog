@@ -41,6 +41,7 @@ class ParseArgsTests(unittest.TestCase):
         self.assertEqual(args.approval_policy, "never")
         self.assertTrue(args.auto_approve)
         self.assertTrue(args.local_tool_routing)
+        self.assertEqual(args.local_tool_shell_mode, "subprocess")
         self.assertFalse(args.show_raw_json)
         self.assertIsNone(args.token)
         self.assertIsNone(args.provider_id)
@@ -58,6 +59,8 @@ class ParseArgsTests(unittest.TestCase):
                 "--show-raw-json",
                 "--thread-id",
                 "thr_123",
+                "--local-tool-shell-mode",
+                "persistent",
                 "--token",
                 "token-xyz",
                 "--provider-id",
@@ -71,6 +74,7 @@ class ParseArgsTests(unittest.TestCase):
         self.assertEqual(args.approval_policy, "on-request")
         self.assertFalse(args.auto_approve)
         self.assertFalse(args.local_tool_routing)
+        self.assertEqual(args.local_tool_shell_mode, "persistent")
         self.assertTrue(args.show_raw_json)
         self.assertEqual(args.thread_id, "thr_123")
         self.assertEqual(args.token, "token-xyz")
@@ -164,6 +168,7 @@ class LocalToolRoutingTests(unittest.IsolatedAsyncioTestCase):
             final_only=True,
             show_raw_json=False,
             local_tool_routing=True,
+            local_tool_shell_mode="subprocess",
             gateway_token=None,
             gateway_provider_id=None,
             gateway_providers=None,
@@ -174,6 +179,38 @@ class LocalToolRoutingTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertFalse(result["success"])
         self.assertIn("Unsupported dynamic tool", result["contentItems"][0]["text"])
+
+
+class PersistentShellHelpersTests(unittest.TestCase):
+    def _client(self) -> repl.AppServerWsRepl:
+        return repl.AppServerWsRepl(
+            uri="ws://127.0.0.1:4222",
+            approval_policy="never",
+            model=None,
+            cwd=None,
+            model_provider=None,
+            auto_approve=True,
+            final_only=True,
+            show_raw_json=False,
+            local_tool_routing=True,
+            local_tool_shell_mode="persistent",
+            gateway_token=None,
+            gateway_provider_id=None,
+            gateway_providers=None,
+        )
+
+    def test_shell_kind_detection(self) -> None:
+        client = self._client()
+        self.assertEqual(client._shell_kind_for_path("/bin/zsh"), "posix")  # noqa: SLF001
+        self.assertEqual(client._shell_kind_for_path("pwsh"), "powershell")  # noqa: SLF001
+        self.assertEqual(client._shell_kind_for_path("cmd.exe"), "cmd")  # noqa: SLF001
+
+    def test_posix_command_with_marker_wraps_cd_and_printf(self) -> None:
+        client = self._client()
+        command = client._command_with_marker("echo hi", "/tmp/test dir", "M", "posix")  # noqa: SLF001
+        self.assertIn("cd '/tmp/test dir'", command)
+        self.assertIn("echo hi", command)
+        self.assertIn("printf 'M:%s\\n' \"$?\"", command)
 
 
 if __name__ == "__main__":
