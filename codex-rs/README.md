@@ -1,17 +1,42 @@
 # Codex CLI (Rust Implementation)
 
-We provide Codex CLI as a standalone, native executable to ensure a zero-dependency install.
+This repository contains the Rust implementation that backs the `codex-hsog` student distribution.
 
-## Installing Codex
+## HSOG fork note
 
-Today, the easiest way to install Codex is via `npm`:
+- This fork carries an HSOG-specific patch so the Rust CLI can continue to process gateway traffic that only exposes Completions or Chat Completions semantics where upstream Codex expects Responses.
+- Student releases are distributed as native launcher bundles, not via the upstream `npm` package.
+- The student-facing binary name is `codex-hsog` to avoid colliding with an existing upstream `codex` install.
+
+## Student launcher usage
+
+Students should download the release bundle for their platform from:
+
+- <https://github.com/grabow/codex-hsog/releases/latest>
+
+Bundle mapping:
+
+- macOS Apple Silicon: `codex-hsog-macos-aarch64.tar.gz`
+- macOS Intel: `codex-hsog-macos-x86_64.tar.gz`
+- Linux x86_64: `codex-hsog-linux-x86_64.tar.gz`
+- Linux ARM64: `codex-hsog-linux-aarch64.tar.gz`
+- Windows x86_64: `codex-hsog-windows-x86_64.zip`
+
+Windows ARM64 is currently not provided.
+
+The recommended way for students to start the patched CLI is via the launcher included in each release bundle:
 
 ```shell
-npm i -g @openai/codex
-codex
+./start-codex-hsog.sh
 ```
 
-You can also install via Homebrew (`brew install --cask codex`) or download a platform-specific release directly from our [GitHub Releases](https://github.com/openai/codex/releases).
+or on Windows PowerShell:
+
+```powershell
+.\start-codex-hsog.ps1
+```
+
+The launcher prompts for `HSOG_API_KEY` if needed and injects the HSOG provider settings on the command line, so students do not need to edit `~/.codex/config.toml` for initial setup.
 
 ## Documentation quickstart
 

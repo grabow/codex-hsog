@@ -1,59 +1,67 @@
-<p align="center"><code>npm i -g @openai/codex</code><br />or <code>brew install --cask codex</code></p>
-<p align="center"><strong>Codex CLI</strong> is a coding agent from OpenAI that runs locally on your computer.
+<p align="center"><strong>Codex HSOG</strong> is an HS Offenburg fork of the Rust-based Codex CLI.
 <p align="center">
   <img src="https://github.com/openai/codex/blob/main/.github/codex-cli-splash.png" alt="Codex CLI splash" width="80%" />
 </p>
 </br>
-If you want Codex in your code editor (VS Code, Cursor, Windsurf), <a href="https://developers.openai.com/codex/ide">install in your IDE.</a>
-</br>If you are looking for the <em>cloud-based agent</em> from OpenAI, <strong>Codex Web</strong>, go to <a href="https://chatgpt.com/codex">chatgpt.com/codex</a>.</p>
+This fork is intended for student distribution via native launcher bundles and keeps a local patch in the Rust implementation so the CLI can still work with gateways that provide Completions or Chat Completions behavior where upstream Codex expects Responses.</p>
 
 ---
 
-## Quickstart
+## Fork note
 
-### Installing and running Codex CLI
+This repository is not the stock upstream Codex distribution.
 
-Install globally with your preferred package manager:
+- It is a fork of the Rust Codex CLI.
+- It contains an HSOG-specific patch so the Rust version can continue to process gateway traffic that only exposes Completions or Chat Completions semantics.
+- The Node/`npm` variant is not the patched student distribution.
+- Student-facing releases are published as `codex-hsog` so they can coexist with an existing upstream `codex` install.
+
+## Using Student Releases
+
+Students should download the platform-specific bundle from the releases of this fork:
+
+- <https://github.com/grabow/codex-hsog/releases/latest>
+
+Each bundle already contains:
+
+- the native `codex-hsog` binary
+- a launcher script
+- a short `README.txt`
+
+Choose the bundle that matches the student machine:
+
+- macOS Apple Silicon: `codex-hsog-macos-aarch64.tar.gz`
+- macOS Intel: `codex-hsog-macos-x86_64.tar.gz`
+- Linux x86_64: `codex-hsog-linux-x86_64.tar.gz`
+- Linux ARM64: `codex-hsog-linux-aarch64.tar.gz`
+- Windows x86_64: `codex-hsog-windows-x86_64.zip`
+
+Windows ARM64 is currently not provided.
+
+The launcher is the supported entry point for students. It injects the HSOG provider configuration on the command line and prompts for `HSOG_API_KEY` on first use, so no manual `config.toml` editing is required.
+
+### Launcher usage
+
+macOS / Linux:
 
 ```shell
-# Install using npm
-npm install -g @openai/codex
+./start-codex-hsog.sh
 ```
+
+Windows PowerShell:
+
+```powershell
+.\start-codex-hsog.ps1
+```
+
+You can pass normal Codex arguments through the launcher, for example:
 
 ```shell
-# Install using Homebrew
-brew install --cask codex
+./start-codex-hsog.sh --help
 ```
-
-Then simply run `codex` to get started.
-
-<details>
-<summary>You can also go to the <a href="https://github.com/openai/codex/releases/latest">latest GitHub Release</a> and download the appropriate binary for your platform.</summary>
-
-Each GitHub Release contains many executables, but in practice, you likely want one of these:
-
-- macOS
-  - Apple Silicon/arm64: `codex-aarch64-apple-darwin.tar.gz`
-  - x86_64 (older Mac hardware): `codex-x86_64-apple-darwin.tar.gz`
-- Linux
-  - x86_64: `codex-x86_64-unknown-linux-musl.tar.gz`
-  - arm64: `codex-aarch64-unknown-linux-musl.tar.gz`
-
-Each archive contains a single entry with the platform baked into the name (e.g., `codex-x86_64-unknown-linux-musl`), so you likely want to rename it to `codex` after extracting it.
-
-</details>
-
-### Using Codex with your ChatGPT plan
-
-Run `codex` and select **Sign in with ChatGPT**. We recommend signing into your ChatGPT account to use Codex as part of your Plus, Pro, Team, Edu, or Enterprise plan. [Learn more about what's included in your ChatGPT plan](https://help.openai.com/en/articles/11369540-codex-in-chatgpt).
-
-You can also use Codex with an API key, but this requires [additional setup](https://developers.openai.com/codex/auth#sign-in-with-an-api-key).
 
 ## Docs
 
-- [**Codex Documentation**](https://developers.openai.com/codex)
 - [**Contributing**](./docs/contributing.md)
-- [**Installing & building**](./docs/install.md)
-- [**Open source fund**](./docs/open-source-fund.md)
 
 This repository is licensed under the [Apache-2.0 License](LICENSE).
