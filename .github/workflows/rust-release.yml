@@ -429,6 +429,13 @@ jobs:
         run: |
           set -euo pipefail
           version="${VERSION}"
+          prerelease="false"
+
+          if [[ "${version}" =~ ^[0-9]+\.[0-9]+\.[0-9]+-(alpha|beta|rc)(\.[0-9]+)?$ ]]; then
+            prerelease="true"
+          fi
+
+          echo "prerelease=${prerelease}" >> "$GITHUB_OUTPUT"
 
           if [[ "${version}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
             echo "should_publish=true" >> "$GITHUB_OUTPUT"
@@ -484,9 +491,8 @@ jobs:
             dist/**/codex-hsog-linux-x86_64.tar.gz
             dist/**/codex-hsog-windows-x86_64.zip
             dist/config-schema.json
-          # Mark as prerelease only when the version has a suffix after x.y.z
-          # (e.g. -alpha, -beta). Otherwise publish a normal release.
-          prerelease: ${{ contains(steps.release_name.outputs.name, '-') }}
+          # Treat only conventional prerelease channels as prereleases.
+          prerelease: ${{ steps.npm_publish_settings.outputs.prerelease == 'true' }}
 
       - uses: facebook/dotslash-publish-release@v2
         if: ${{ github.repository == 'openai/codex' }}
