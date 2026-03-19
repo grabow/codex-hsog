@@ -2,9 +2,13 @@ from __future__ import annotations
 
 import json
 import os
+from pathlib import Path
 import tempfile
+from types import SimpleNamespace
+from typing import Any
 import unittest
 from unittest import mock
+import urllib.error
 
 import python.app_server_ws_repl as repl
 
@@ -46,9 +50,15 @@ class ParseArgsTests(unittest.TestCase):
         self.assertEqual(args.local_tool_shell_mode, "subprocess")
         self.assertEqual(args.local_tool_shell_init, "auto")
         self.assertFalse(args.show_raw_json)
+        self.assertEqual(args.input_ui, "prompt-toolkit")
+        self.assertTrue(args.gateway_activity_indicator)
         self.assertIsNone(args.token)
         self.assertIsNone(args.provider_id)
         self.assertIsNone(args.providers_json)
+        self.assertTrue(args.provider_preflight)
+        self.assertEqual(args.provider_preflight_timeout_sec, 8.0)
+        self.assertIsNone(args.thread_config_json)
+        self.assertIsNone(args.mcp_servers_json)
 
     def test_overrides(self) -> None:
         args = repl.parse_args(
@@ -60,6 +70,9 @@ class ParseArgsTests(unittest.TestCase):
                 "--no-auto-approve",
                 "--no-local-tool-routing",
                 "--show-raw-json",
+                "--input-ui",
+                "raw-tty",
+                "--no-gateway-activity-indicator",
                 "--thread-id",
                 "thr_123",
                 "--local-tool-shell-mode",
@@ -72,6 +85,13 @@ class ParseArgsTests(unittest.TestCase):
                 "academic",
                 "--providers-json",
                 '[{"providerId":"academic","baseUrl":"https://example/v1","apiKey":"k","wireApi":"chat_completions"}]',
+                "--no-provider-preflight",
+                "--provider-preflight-timeout-sec",
+                "3.5",
+                "--thread-config-json",
+                '{"features.tools_web_search": true}',
+                "--mcp-servers-json",
+                '{"moodle": {"url": "http://127.0.0.1:8765/mcp"}}',
             ]
         )
 
@@ -79,6 +99,8 @@ class ParseArgsTests(unittest.TestCase):
         self.assertEqual(args.approval_policy, "on-request")
         self.assertFalse(args.auto_approve)
         self.assertFalse(args.local_tool_routing)
+        self.assertEqual(args.input_ui, "raw-tty")
+        self.assertFalse(args.gateway_activity_indicator)
         self.assertEqual(args.local_tool_shell_mode, "persistent")
         self.assertEqual(args.local_tool_shell_init, "source ~/.zshrc")
         self.assertTrue(args.show_raw_json)
@@ -86,6 +108,10 @@ class ParseArgsTests(unittest.TestCase):
         self.assertEqual(args.token, "token-xyz")
         self.assertEqual(args.provider_id, "academic")
         self.assertIn("providerId", args.providers_json)
+        self.assertFalse(args.provider_preflight)
+        self.assertEqual(args.provider_preflight_timeout_sec, 3.5)
+        self.assertIn("features.tools_web_search", args.thread_config_json)
+        self.assertIn("moodle", args.mcp_servers_json)
 
 
 class WordMoveTests(unittest.TestCase):
@@ -129,6 +155,34 @@ class StreamFormatTests(unittest.TestCase):
         self.assertEqual(repl.format_ephemeral_status_text(text), "step one step two")
 
 
+class PasteHandlingTests(unittest.TestCase):
+    def test_normalize_pasted_text_flattens_newlines(self) -> None:
+        pasted = "Ziel:\r\nFunktion A\nFunktion B\rEnde"
+        self.assertEqual(
+            repl._normalize_pasted_text(pasted),  # noqa: SLF001
+            "Ziel: Funktion A Funktion B Ende",
+        )
+
+    def test_read_until_bracketed_paste_end(self) -> None:
+        chunks = iter(list("Line1\nLine2\x1b[201~tail"))
+
+        def _read_char(_: int) -> str:
+            return next(chunks, "")
+
+        self.assertEqual(
+            repl._read_until_bracketed_paste_end(_read_char),  # noqa: SLF001
+            "Line1\nLine2",
+        )
+
+
+class InputUiSelectionTests(unittest.TestCase):
+    def test_should_use_prompt_toolkit_respects_raw_tty(self) -> None:
+        self.assertFalse(repl._should_use_prompt_toolkit("raw-tty"))  # noqa: SLF001
+
+    def test_should_use_prompt_toolkit_forced(self) -> None:
+        self.assertTrue(repl._should_use_prompt_toolkit("prompt-toolkit"))  # noqa: SLF001
+
+
 class GatewayHelpersTests(unittest.TestCase):
     def test_uri_with_token_replaces_query_token(self) -> None:
         uri = repl.uri_with_token("ws://127.0.0.1:4321/ws?foo=1&token=old", "new")
@@ -161,6 +215,72 @@ class GatewayHelpersTests(unittest.TestCase):
         assert providers is not None
         self.assertEqual(providers[0]["wireApi"], "responses")
 
+    def test_find_gateway_provider(self) -> None:
+        provider = repl._find_gateway_provider(  # noqa: SLF001
+            [{"providerId": "a"}, {"providerId": "b"}],
+            "b",
+        )
+        assert provider is not None
+        self.assertEqual(provider["providerId"], "b")
+
+    def test_load_thread_config_overrides(self) -> None:
+        overrides = repl.load_thread_config_overrides('{"features.tools_web_search": true}')
+        assert overrides is not None
+        self.assertTrue(overrides["features.tools_web_search"])
+
+    def test_load_thread_config_overrides_from_file_reference(self) -> None:
+        payload = {"features.tools_web_search": True}
+        with tempfile.TemporaryDirectory() as tmp:
+            path = f"{tmp}/thread_config.json"
+            with open(path, "w", encoding="utf-8") as handle:
+                json.dump(payload, handle)
+            overrides = repl.load_thread_config_overrides(f"@{path}")
+        assert overrides is not None
+        self.assertTrue(overrides["features.tools_web_search"])
+
+    def test_load_mcp_server_overrides(self) -> None:
+        overrides = repl.load_mcp_server_overrides(
+            '{"moodle":{"url":"http://127.0.0.1:8765/mcp"}}'
+        )
+        assert overrides is not None
+        self.assertIn("mcp_servers.moodle", overrides)
+        self.assertEqual(overrides["mcp_servers.moodle"]["url"], "http://127.0.0.1:8765/mcp")
+
+    def test_build_thread_config_overrides_merges_sources(self) -> None:
+        merged = repl.build_thread_config_overrides(
+            '{"features.tools_web_search": true}',
+            '{"moodle":{"url":"http://127.0.0.1:8765/mcp"}}',
+        )
+        assert merged is not None
+        self.assertTrue(merged["features.tools_web_search"])
+        self.assertIn("mcp_servers.moodle", merged)
+
+    def test_probe_gateway_provider_models_success(self) -> None:
+        response = mock.MagicMock()
+        response.__enter__.return_value = response
+        response.status = 200
+        with mock.patch("python.app_server_ws_repl.urllib.request.urlopen", return_value=response):
+            ok, detail = repl._probe_gateway_provider_models(  # noqa: SLF001
+                "https://example.invalid/v1",
+                "key",
+                1.0,
+            )
+        self.assertTrue(ok)
+        self.assertEqual(detail, "HTTP 200")
+
+    def test_probe_gateway_provider_models_network_error(self) -> None:
+        with mock.patch(
+            "python.app_server_ws_repl.urllib.request.urlopen",
+            side_effect=urllib.error.URLError("timed out"),
+        ):
+            ok, detail = repl._probe_gateway_provider_models(  # noqa: SLF001
+                "https://example.invalid/v1",
+                "key",
+                1.0,
+            )
+        self.assertFalse(ok)
+        self.assertIn("timed out", detail)
+
 
 class LocalToolRoutingTests(unittest.IsolatedAsyncioTestCase):
     async def test_dynamic_tool_call_unknown(self) -> None:
@@ -179,6 +299,8 @@ class LocalToolRoutingTests(unittest.IsolatedAsyncioTestCase):
             gateway_token=None,
             gateway_provider_id=None,
             gateway_providers=None,
+            provider_preflight=True,
+            provider_preflight_timeout_sec=8.0,
         )
 
         result = await client._handle_dynamic_tool_call(  # noqa: SLF001
@@ -186,6 +308,261 @@ class LocalToolRoutingTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertFalse(result["success"])
         self.assertIn("Unsupported dynamic tool", result["contentItems"][0]["text"])
+
+    async def test_start_thread_merges_thread_config_overrides(self) -> None:
+        captured: dict[str, Any] = {}
+
+        async def _request(method: str, params: dict[str, Any] | None) -> dict[str, Any]:
+            captured["method"] = method
+            captured["params"] = params
+            return {"thread": {"id": "thread-1"}}
+
+        client = repl.AppServerWsRepl(
+            uri="ws://127.0.0.1:4222",
+            approval_policy="never",
+            model=None,
+            cwd=None,
+            model_provider=None,
+            auto_approve=True,
+            final_only=True,
+            show_raw_json=False,
+            local_tool_routing=True,
+            local_tool_shell_mode="subprocess",
+            local_tool_shell_init=None,
+            gateway_token=None,
+            gateway_provider_id=None,
+            gateway_providers=None,
+            provider_preflight=False,
+            provider_preflight_timeout_sec=8.0,
+            thread_config_overrides={
+                "mcp_servers.moodle": {"url": "http://127.0.0.1:8765/mcp"},
+            },
+        )
+        client.request = _request  # type: ignore[method-assign]
+
+        await client.start_thread()
+        params = captured["params"]
+        assert params is not None
+        self.assertEqual(captured["method"], "thread/start")
+        self.assertEqual(
+            params["config"]["mcp_servers.moodle"]["url"],
+            "http://127.0.0.1:8765/mcp",
+        )
+        self.assertFalse(params["config"]["features.shell_tool"])
+
+    async def test_dynamic_tool_specs_include_apply_patch(self) -> None:
+        client = repl.AppServerWsRepl(
+            uri="ws://127.0.0.1:4222",
+            approval_policy="never",
+            model=None,
+            cwd=None,
+            model_provider=None,
+            auto_approve=True,
+            final_only=True,
+            show_raw_json=False,
+            local_tool_routing=True,
+            local_tool_shell_mode="subprocess",
+            local_tool_shell_init=None,
+            gateway_token=None,
+            gateway_provider_id=None,
+            gateway_providers=None,
+            provider_preflight=False,
+            provider_preflight_timeout_sec=8.0,
+        )
+        with mock.patch("python.app_server_ws_repl.shutil.which", return_value="/usr/local/bin/apply_patch"):
+            tool_names = [tool["name"] for tool in client._local_dynamic_tools()]  # noqa: SLF001
+        self.assertIn("apply_patch", tool_names)
+
+    async def test_dynamic_tool_specs_hide_apply_patch_when_unavailable(self) -> None:
+        client = repl.AppServerWsRepl(
+            uri="ws://127.0.0.1:4222",
+            approval_policy="never",
+            model=None,
+            cwd=None,
+            model_provider=None,
+            auto_approve=True,
+            final_only=True,
+            show_raw_json=False,
+            local_tool_routing=True,
+            local_tool_shell_mode="subprocess",
+            local_tool_shell_init=None,
+            gateway_token=None,
+            gateway_provider_id=None,
+            gateway_providers=None,
+            provider_preflight=False,
+            provider_preflight_timeout_sec=8.0,
+        )
+        with mock.patch("python.app_server_ws_repl.shutil.which", return_value=None):
+            tool_names = [tool["name"] for tool in client._local_dynamic_tools()]  # noqa: SLF001
+        self.assertNotIn("apply_patch", tool_names)
+
+    async def test_handle_dynamic_apply_patch_success(self) -> None:
+        class _FakeProcess:
+            returncode = 0
+
+            async def communicate(self, _input: bytes) -> tuple[bytes, bytes]:
+                return b"Patch applied successfully.", b""
+
+        client = repl.AppServerWsRepl(
+            uri="ws://127.0.0.1:4222",
+            approval_policy="never",
+            model=None,
+            cwd=None,
+            model_provider=None,
+            auto_approve=True,
+            final_only=True,
+            show_raw_json=False,
+            local_tool_routing=True,
+            local_tool_shell_mode="subprocess",
+            local_tool_shell_init=None,
+            gateway_token=None,
+            gateway_provider_id=None,
+            gateway_providers=None,
+            provider_preflight=False,
+            provider_preflight_timeout_sec=8.0,
+        )
+        with mock.patch(
+            "python.app_server_ws_repl.asyncio.create_subprocess_exec",
+            return_value=_FakeProcess(),
+        ):
+            with mock.patch("python.app_server_ws_repl.shutil.which", return_value="/usr/local/bin/apply_patch"):
+                result = await client._handle_dynamic_apply_patch(  # noqa: SLF001
+                    {"patch": "*** Begin Patch\n*** End Patch\n"}
+                )
+        self.assertTrue(result["success"])
+        self.assertIn("Patch applied successfully.", result["contentItems"][0]["text"])
+
+    async def test_handle_dynamic_apply_patch_requires_patch(self) -> None:
+        client = repl.AppServerWsRepl(
+            uri="ws://127.0.0.1:4222",
+            approval_policy="never",
+            model=None,
+            cwd=None,
+            model_provider=None,
+            auto_approve=True,
+            final_only=True,
+            show_raw_json=False,
+            local_tool_routing=True,
+            local_tool_shell_mode="subprocess",
+            local_tool_shell_init=None,
+            gateway_token=None,
+            gateway_provider_id=None,
+            gateway_providers=None,
+            provider_preflight=False,
+            provider_preflight_timeout_sec=8.0,
+        )
+        result = await client._handle_dynamic_apply_patch({})  # noqa: SLF001
+        self.assertFalse(result["success"])
+        self.assertIn("requires a 'patch' string", result["contentItems"][0]["text"])
+
+    async def test_handle_dynamic_apply_patch_missing_binary_reports_clear_error(self) -> None:
+        client = repl.AppServerWsRepl(
+            uri="ws://127.0.0.1:4222",
+            approval_policy="never",
+            model=None,
+            cwd=None,
+            model_provider=None,
+            auto_approve=True,
+            final_only=True,
+            show_raw_json=False,
+            local_tool_routing=True,
+            local_tool_shell_mode="subprocess",
+            local_tool_shell_init=None,
+            gateway_token=None,
+            gateway_provider_id=None,
+            gateway_providers=None,
+            provider_preflight=False,
+            provider_preflight_timeout_sec=8.0,
+        )
+        with mock.patch("python.app_server_ws_repl.shutil.which", return_value=None):
+            result = await client._handle_dynamic_apply_patch(  # noqa: SLF001
+                {"patch": "*** Begin Patch\n*** End Patch\n"}
+            )
+        self.assertFalse(result["success"])
+        self.assertIn("not a read-only indicator", result["contentItems"][0]["text"])
+
+    async def test_dynamic_exec_command_falls_back_for_unavailable_workdir(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            client = repl.AppServerWsRepl(
+                uri="ws://127.0.0.1:4222",
+                approval_policy="never",
+                model=None,
+                cwd=tmp,
+                model_provider=None,
+                auto_approve=True,
+                final_only=True,
+                show_raw_json=False,
+                local_tool_routing=True,
+                local_tool_shell_mode="subprocess",
+                local_tool_shell_init=None,
+                gateway_token=None,
+                gateway_provider_id=None,
+                gateway_providers=None,
+                provider_preflight=False,
+                provider_preflight_timeout_sec=8.0,
+            )
+            fake_process = SimpleNamespace(returncode=0, stdin=None, stdout=None, stderr=None)
+            fake_session = SimpleNamespace(
+                session_id=1,
+                process=fake_process,
+                completion_event=SimpleNamespace(is_set=lambda: True),
+                persistent_shell=False,
+                started_at=0.0,
+            )
+            with mock.patch(
+                "python.app_server_ws_repl.asyncio.create_subprocess_exec",
+                new=mock.AsyncMock(return_value=fake_process),
+            ) as create_proc:
+                with mock.patch.object(client, "_register_local_session", return_value=fake_session):
+                    with mock.patch.object(client, "_collect_session_output", new=mock.AsyncMock(return_value=("ok", 1))):
+                        with mock.patch.object(client, "_finalize_local_session", new=mock.AsyncMock()):
+                            with mock.patch.object(client, "_format_dynamic_exec_output", return_value="formatted") as formatter:
+                                result = await client._handle_dynamic_exec_command(  # noqa: SLF001
+                                    {"cmd": "pwd", "workdir": "/definitely/missing/path"}
+                                )
+
+            self.assertTrue(result["success"])
+            self.assertEqual(create_proc.await_args.kwargs["cwd"], tmp)
+            self.assertIsNotNone(formatter.call_args.kwargs["workdir_note"])
+
+    async def test_dynamic_apply_patch_falls_back_for_unavailable_workdir(self) -> None:
+        class _FakeProcess:
+            returncode = 0
+
+            async def communicate(self, _input: bytes) -> tuple[bytes, bytes]:
+                return b"Patch applied successfully.", b""
+
+        with tempfile.TemporaryDirectory() as tmp:
+            client = repl.AppServerWsRepl(
+                uri="ws://127.0.0.1:4222",
+                approval_policy="never",
+                model=None,
+                cwd=tmp,
+                model_provider=None,
+                auto_approve=True,
+                final_only=True,
+                show_raw_json=False,
+                local_tool_routing=True,
+                local_tool_shell_mode="subprocess",
+                local_tool_shell_init=None,
+                gateway_token=None,
+                gateway_provider_id=None,
+                gateway_providers=None,
+                provider_preflight=False,
+                provider_preflight_timeout_sec=8.0,
+            )
+            with mock.patch(
+                "python.app_server_ws_repl.asyncio.create_subprocess_exec",
+                new=mock.AsyncMock(return_value=_FakeProcess()),
+            ) as create_proc:
+                with mock.patch("python.app_server_ws_repl.shutil.which", return_value="/usr/local/bin/apply_patch"):
+                    result = await client._handle_dynamic_apply_patch(  # noqa: SLF001
+                        {"patch": "*** Begin Patch\n*** End Patch\n", "workdir": "/definitely/missing/path"}
+                    )
+
+            self.assertTrue(result["success"])
+            self.assertEqual(create_proc.await_args.kwargs["cwd"], tmp)
+            self.assertIn("Requested workdir", result["contentItems"][0]["text"])
 
 
 class PersistentShellHelpersTests(unittest.TestCase):
@@ -205,6 +582,8 @@ class PersistentShellHelpersTests(unittest.TestCase):
             gateway_token=None,
             gateway_provider_id=None,
             gateway_providers=None,
+            provider_preflight=True,
+            provider_preflight_timeout_sec=8.0,
         )
 
     def test_shell_kind_detection(self) -> None:
@@ -292,6 +671,57 @@ class PersistentShellHelpersTests(unittest.TestCase):
                 tmp,
             )
         self.assertEqual(rewritten, "uv run python script.py")
+
+    def test_resolve_local_tool_workdir_falls_back_to_client_cwd(self) -> None:
+        client = self._client()
+        with tempfile.TemporaryDirectory() as tmp:
+            client.cwd = tmp
+            resolved, note = client._resolve_local_tool_workdir("/definitely/missing/path")  # noqa: SLF001
+        self.assertEqual(resolved, tmp)
+        self.assertIsNotNone(note)
+
+    def test_resolve_local_tool_workdir_resolves_existing_relative_path(self) -> None:
+        client = self._client()
+        with tempfile.TemporaryDirectory() as tmp:
+            nested = Path(tmp) / "nested"
+            nested.mkdir()
+            client.cwd = tmp
+            resolved, note = client._resolve_local_tool_workdir("nested")  # noqa: SLF001
+        self.assertEqual(resolved, str(nested.resolve()))
+        self.assertIsNone(note)
+
+
+class NotificationHandlingTests(unittest.TestCase):
+    def _client(self) -> repl.AppServerWsRepl:
+        return repl.AppServerWsRepl(
+            uri="ws://127.0.0.1:4222",
+            approval_policy="never",
+            model=None,
+            cwd=None,
+            model_provider=None,
+            auto_approve=True,
+            final_only=True,
+            show_raw_json=False,
+            local_tool_routing=True,
+            local_tool_shell_mode="subprocess",
+            local_tool_shell_init=None,
+            gateway_token=None,
+            gateway_provider_id=None,
+            gateway_providers=None,
+            provider_preflight=True,
+            provider_preflight_timeout_sec=8.0,
+        )
+
+    def test_agent_message_notification_prints_message(self) -> None:
+        client = self._client()
+        with mock.patch.object(client, "_clear_ephemeral_status") as clear_status:
+            with mock.patch("builtins.print") as print_mock:
+                client._handle_notification(
+                    "codex/event/agent_message",
+                    {"msg": {"type": "agent_message", "message": "Hello from provider"}},
+                )
+        clear_status.assert_called_once()
+        print_mock.assert_called_once_with("Hello from provider", end="\n", flush=True)
 
 
 if __name__ == "__main__":

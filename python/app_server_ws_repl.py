@@ -27,21 +27,38 @@ import os
 from pathlib import Path
 import platform
 import re
+import shutil
 import shlex
+import socket
 import sys
 import termios
+import time
 import tty
 import uuid
 from typing import Any
+from typing import Callable
+import urllib.error
 from urllib.parse import parse_qsl
 from urllib.parse import urlencode
 from urllib.parse import urlparse
 from urllib.parse import urlunparse
+import urllib.request
 
 try:
     import websockets
 except Exception:  # pragma: no cover - optional for parser-only tests
     websockets = None
+
+try:
+    from prompt_toolkit import PromptSession
+    from prompt_toolkit.history import FileHistory
+    from prompt_toolkit.key_binding import KeyBindings
+    from prompt_toolkit.patch_stdout import patch_stdout
+except Exception:  # pragma: no cover - optional dependency at runtime
+    PromptSession = None  # type: ignore[assignment]
+    FileHistory = None  # type: ignore[assignment]
+    KeyBindings = None  # type: ignore[assignment]
+    patch_stdout = None  # type: ignore[assignment]
 
 
 @dataclass
@@ -153,6 +170,91 @@ def load_gateway_providers(raw: str | None) -> list[dict[str, Any]] | None:
     return providers
 
 
+def _load_json_from_inline_or_file(raw: str | None, *, arg_name: str) -> Any:
+    if raw is None:
+        return None
+    value = raw.strip()
+    if not value:
+        return None
+
+    if value.startswith("@"):
+        file_path = Path(value[1:])
+        try:
+            value = file_path.read_text(encoding="utf-8")
+        except OSError as exc:
+            raise RuntimeError(f"could not read {arg_name} file `{file_path}`: {exc}") from exc
+
+    try:
+        return json.loads(value)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"invalid {arg_name} value: {exc}") from exc
+
+
+def load_thread_config_overrides(raw: str | None) -> dict[str, Any] | None:
+    decoded = _load_json_from_inline_or_file(raw, arg_name="--thread-config-json")
+    if decoded is None:
+        return None
+    if not isinstance(decoded, dict):
+        raise RuntimeError("--thread-config-json must decode to a JSON object")
+    return decoded
+
+
+def load_mcp_server_overrides(raw: str | None) -> dict[str, Any] | None:
+    decoded = _load_json_from_inline_or_file(raw, arg_name="--mcp-servers-json")
+    if decoded is None:
+        return None
+    if not isinstance(decoded, dict):
+        raise RuntimeError("--mcp-servers-json must decode to a JSON object")
+
+    overrides: dict[str, Any] = {}
+    for name, entry in decoded.items():
+        if not isinstance(name, str) or not name.strip():
+            raise RuntimeError("--mcp-servers-json keys must be non-empty strings")
+        if not isinstance(entry, dict):
+            raise RuntimeError(
+                f"--mcp-servers-json entry `{name}` must be an object"
+            )
+        overrides[f"mcp_servers.{name.strip()}"] = entry
+    return overrides
+
+
+def _find_gateway_provider(
+    providers: list[dict[str, Any]],
+    provider_id: str,
+) -> dict[str, Any] | None:
+    for provider in providers:
+        if str(provider.get("providerId", "")).strip() == provider_id:
+            return provider
+    return None
+
+
+def _probe_gateway_provider_models(
+    base_url: str,
+    api_key: str | None,
+    timeout_sec: float,
+) -> tuple[bool, str]:
+    url = f"{base_url.rstrip('/')}/models"
+    headers = {"Accept": "application/json"}
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+
+    request = urllib.request.Request(url, headers=headers, method="GET")
+    try:
+        with urllib.request.urlopen(request, timeout=max(0.1, timeout_sec)) as response:
+            status = getattr(response, "status", 200)
+            return True, f"HTTP {status}"
+    except urllib.error.HTTPError as exc:
+        # Reachable endpoint, but auth/payload/path may be rejected.
+        return True, f"HTTP {exc.code}"
+    except urllib.error.URLError as exc:
+        reason = getattr(exc, "reason", exc)
+        return False, str(reason)
+    except TimeoutError:
+        return False, "timeout"
+    except socket.timeout:
+        return False, "timeout"
+
+
 def format_stream_text(text: str) -> str:
     """Improve readability of streamed markdown-like status markers."""
     if "**" not in text:
@@ -173,6 +275,9 @@ def format_ephemeral_status_text(text: str) -> str:
 _HISTORY_PATH = Path.home() / ".codex_ws_repl_history"
 _INPUT_HISTORY: list[str] = []
 _HISTORY_CONFIGURED = False
+_BRACKETED_PASTE_ENABLE = "\x1b[?2004h"
+_BRACKETED_PASTE_DISABLE = "\x1b[?2004l"
+_BRACKETED_PASTE_END = "\x1b[201~"
 
 
 def configure_readline() -> None:
@@ -245,6 +350,31 @@ def _push_history(line: str) -> None:
     _INPUT_HISTORY.append(line)
 
 
+def _normalize_pasted_text(text: str) -> str:
+    normalized = text.replace("\r\n", "\n").replace("\r", "\n")
+    return " ".join(normalized.split("\n"))
+
+
+def _read_until_bracketed_paste_end(read_char: Callable[[int], str]) -> str:
+    tail = ""
+    content: list[str] = []
+    end_len = len(_BRACKETED_PASTE_END)
+    while True:
+        ch = read_char(1)
+        if not ch:
+            if tail:
+                content.append(tail)
+            break
+        tail += ch
+        if tail.endswith(_BRACKETED_PASTE_END):
+            content.append(tail[:-end_len])
+            break
+        if len(tail) > end_len:
+            content.append(tail[0])
+            tail = tail[1:]
+    return "".join(content)
+
+
 def read_user_input(prompt: str) -> str:
     if not sys.stdin.isatty() or not sys.stdout.isatty():
         line = input(prompt)
@@ -263,6 +393,8 @@ def read_user_input(prompt: str) -> str:
     old_settings = termios.tcgetattr(fd)
     try:
         tty.setraw(fd)
+        sys.stdout.write(_BRACKETED_PASTE_ENABLE)
+        sys.stdout.flush()
         while True:
             ch = sys.stdin.read(1)
 
@@ -330,6 +462,16 @@ def read_user_input(prompt: str) -> str:
                             key = part
                             break
                         seq += part
+                    if seq == "200" and key == "~":
+                        pasted = _normalize_pasted_text(
+                            _read_until_bracketed_paste_end(sys.stdin.read)
+                        )
+                        if pasted:
+                            buffer[cursor:cursor] = list(pasted)
+                            cursor += len(pasted)
+                            history_index = None
+                            _redraw_input_line(prompt, buffer, cursor)
+                        continue
                     if ";" in seq:
                         modifier = seq.split(";")[-1]
 
@@ -387,7 +529,44 @@ def read_user_input(prompt: str) -> str:
                 history_index = None
                 _redraw_input_line(prompt, buffer, cursor)
     finally:
+        with contextlib.suppress(Exception):
+            sys.stdout.write(_BRACKETED_PASTE_DISABLE)
+            sys.stdout.flush()
         termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+
+
+def _prompt_toolkit_available() -> bool:
+    return (
+        PromptSession is not None
+        and FileHistory is not None
+        and KeyBindings is not None
+        and patch_stdout is not None
+    )
+
+
+def _should_use_prompt_toolkit(input_ui: str) -> bool:
+    normalized = input_ui.strip().lower()
+    if normalized == "raw-tty":
+        return False
+    if normalized == "prompt-toolkit":
+        return True
+    return _prompt_toolkit_available()
+
+
+def _build_prompt_toolkit_session() -> Any | None:
+    if not _prompt_toolkit_available():
+        return None
+    key_bindings = KeyBindings()
+
+    @key_bindings.add("c-x")
+    def _clear_current_input(event: Any) -> None:
+        event.current_buffer.reset()
+
+    return PromptSession(
+        history=FileHistory(str(_HISTORY_PATH)),
+        key_bindings=key_bindings,
+        multiline=False,
+    )
 
 
 class AppServerWsRepl:
@@ -407,6 +586,10 @@ class AppServerWsRepl:
         gateway_token: str | None,
         gateway_provider_id: str | None,
         gateway_providers: list[dict[str, Any]] | None,
+        provider_preflight: bool,
+        provider_preflight_timeout_sec: float,
+        gateway_activity_indicator: bool = True,
+        thread_config_overrides: dict[str, Any] | None = None,
     ) -> None:
         self.uri = uri
         self.approval_policy = approval_policy
@@ -428,6 +611,10 @@ class AppServerWsRepl:
             gateway_provider_id.strip() if isinstance(gateway_provider_id, str) else None
         )
         self.gateway_providers = gateway_providers or []
+        self.provider_preflight = provider_preflight
+        self.provider_preflight_timeout_sec = max(0.1, provider_preflight_timeout_sec)
+        self.gateway_activity_indicator = gateway_activity_indicator
+        self.thread_config_overrides = dict(thread_config_overrides or {})
 
         self._ws: Any | None = None
         self._reader_task: asyncio.Task[None] | None = None
@@ -445,6 +632,17 @@ class AppServerWsRepl:
         self._next_local_session_id = 1
         self._local_exec_sessions: dict[int, LocalExecSession] = {}
         self._persistent_shell_session_id: int | None = None
+        self._last_gateway_activity_at = 0.0
+        self._local_apply_patch_path = shutil.which("apply_patch")
+
+    def _pulse_gateway_activity(self, label: str, *, force: bool = False) -> None:
+        if not self.gateway_activity_indicator:
+            return
+        now = time.monotonic()
+        if not force and (now - self._last_gateway_activity_at) < 0.25:
+            return
+        self._last_gateway_activity_at = now
+        self._emit_status_line(f"*+ {label}")
 
     def _clear_ephemeral_status(self) -> None:
         if self._ephemeral_status_active:
@@ -537,10 +735,19 @@ class AppServerWsRepl:
         user_agent = init_result.get("userAgent")
         if user_agent:
             print(f"[init] userAgent={user_agent}")
+        gateway_warning = init_result.get("gatewayWarning")
+        if isinstance(gateway_warning, str) and gateway_warning.strip():
+            self._emit_status_line(f"[gateway-warning] {gateway_warning}")
         if self.local_tool_routing:
             print(
-                f"[local-tools] enabled (exec_command/write_stdin on client, mode={self.local_tool_shell_mode})"
+                "[local-tools] enabled "
+                f"(exec_command/write_stdin/apply_patch on client, mode={self.local_tool_shell_mode})"
             )
+            if self._resolve_apply_patch_path() is None:
+                self._emit_status_line(
+                    "[local-tools] apply_patch not found on client PATH; "
+                    "tool will be hidden and edits should use exec_command."
+                )
         if self.gateway_provider_id:
             print(f"[gateway] default providerId={self.gateway_provider_id}")
 
@@ -585,8 +792,10 @@ class AppServerWsRepl:
         fut: asyncio.Future[dict[str, Any]] = loop.create_future()
         self._pending[request_id] = fut
 
+        self._pulse_gateway_activity(f"-> {method}", force=True)
         await self._ws.send(json.dumps(payload, ensure_ascii=False))
         response = await fut
+        self._pulse_gateway_activity(f"<- {method}")
 
         if "error" in response:
             raise RuntimeError(f"{method} failed: {response['error']}")
@@ -598,11 +807,14 @@ class AppServerWsRepl:
         payload: dict[str, Any] = {"method": method}
         if params is not None:
             payload["params"] = params
+        self._pulse_gateway_activity(f"-> {method}", force=True)
         await self._ws.send(json.dumps(payload, ensure_ascii=False))
 
     async def start_thread(self) -> str:
         if self.local_tool_routing and self.local_tool_shell_mode == "persistent":
             await self._close_persistent_shell_if_any()
+
+        await self._preflight_gateway_provider_if_needed()
 
         params: dict[str, Any] = {
             "approvalPolicy": self.approval_policy,
@@ -615,17 +827,59 @@ class AppServerWsRepl:
             params["modelProvider"] = self.model_provider
         if self.local_tool_routing:
             params["dynamicTools"] = self._local_dynamic_tools()
-            params["config"] = {
-                "features.shell_tool": False,
-            }
             params["developerInstructions"] = self._local_environment_developer_instructions()
+        config_overrides = dict(self.thread_config_overrides)
+        if self.local_tool_routing:
+            config_overrides["features.shell_tool"] = False
+        if config_overrides:
+            params["config"] = config_overrides
         if self.gateway_provider_id:
             params["xGateway"] = {"providerId": self.gateway_provider_id}
 
         result = await self.request("thread/start", params)
         thread_id = result["thread"]["id"]
         self.active_thread_id = thread_id
+        if not self.final_only:
+            effective_cwd = self.cwd or "(server default)"
+            effective_provider = self.gateway_provider_id or self.model_provider or "-"
+            self._emit_status_line(
+                f"[thread] context cwd={effective_cwd} provider={effective_provider}"
+            )
         return thread_id
+
+    async def _preflight_gateway_provider_if_needed(self) -> None:
+        if not self.provider_preflight:
+            return
+        if not self.gateway_provider_id:
+            return
+        if not self.gateway_providers:
+            return
+
+        provider = _find_gateway_provider(self.gateway_providers, self.gateway_provider_id)
+        if provider is None:
+            return
+
+        base_url = str(provider.get("baseUrl", "")).strip()
+        if not base_url:
+            return
+        api_key = str(provider.get("apiKey", "")).strip() or None
+
+        ok, detail = await asyncio.to_thread(
+            _probe_gateway_provider_models,
+            base_url,
+            api_key,
+            self.provider_preflight_timeout_sec,
+        )
+        if ok:
+            return
+
+        raise RuntimeError(
+            (
+                f"Gateway-Provider nicht erreichbar: {self.gateway_provider_id} "
+                f"({base_url}, {detail}). "
+                "Pruefe VPN/Netzwerk oder starte mit --no-provider-preflight."
+            )
+        )
 
     async def resume_thread(self, thread_id: str) -> str:
         if self.local_tool_routing and self.local_tool_shell_mode == "persistent":
@@ -641,6 +895,11 @@ class AppServerWsRepl:
             params["cwd"] = self.cwd
         if self.model_provider:
             params["modelProvider"] = self.model_provider
+        config_overrides = dict(self.thread_config_overrides)
+        if self.local_tool_routing:
+            config_overrides["features.shell_tool"] = False
+        if config_overrides:
+            params["config"] = config_overrides
 
         result = await self.request("thread/resume", params)
         resumed = result["thread"]["id"]
@@ -700,10 +959,16 @@ class AppServerWsRepl:
             raise
         turn_id = result["turn"]["id"]
         self.active_turn_id = turn_id
+        self._pulse_gateway_activity(f"turn active {turn_id}", force=True)
         return turn_id
 
     async def wait_for_turn_completion(self) -> None:
-        await self._turn_done.wait()
+        while True:
+            try:
+                await asyncio.wait_for(self._turn_done.wait(), timeout=2.0)
+                return
+            except TimeoutError:
+                self._pulse_gateway_activity("waiting for turn completion", force=True)
 
     async def interrupt(self, turn_id: str | None) -> None:
         if not self.active_thread_id:
@@ -805,6 +1070,7 @@ class AppServerWsRepl:
             return
 
         if method:
+            self._pulse_gateway_activity(f"<= {method}")
             self._handle_notification(method, msg.get("params") or {})
             return
 
@@ -882,6 +1148,19 @@ class AppServerWsRepl:
             if delta:
                 self._clear_ephemeral_status()
                 print(format_stream_text(delta), end="", flush=True)
+            return
+
+        if method == "codex/event/agent_message":
+            msg = params.get("msg") or {}
+            text = ""
+            if isinstance(msg, dict):
+                raw_message = msg.get("message")
+                if isinstance(raw_message, str):
+                    text = raw_message
+            if text:
+                self._clear_ephemeral_status()
+                rendered = format_stream_text(text)
+                print(rendered, end="" if rendered.endswith("\n") else "\n", flush=True)
             return
 
         if method == "item/commandExecution/outputDelta":
@@ -1001,7 +1280,7 @@ class AppServerWsRepl:
             self._emit_status_line(f"[{method}]")
 
     def _local_dynamic_tools(self) -> list[dict[str, Any]]:
-        return [
+        tools: list[dict[str, Any]] = [
             {
                 "name": "exec_command",
                 "description": "Runs a command on the connected client machine and returns output or a session ID for ongoing interaction.",
@@ -1036,6 +1315,23 @@ class AppServerWsRepl:
                 },
             },
         ]
+        if self._resolve_apply_patch_path() is not None:
+            tools.append(
+                {
+                    "name": "apply_patch",
+                    "description": "Applies a patch on the connected client machine using apply_patch.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "patch": {"type": "string"},
+                            "workdir": {"type": "string"},
+                        },
+                        "required": ["patch"],
+                        "additionalProperties": False,
+                    },
+                }
+            )
+        return tools
 
     def _local_environment_developer_instructions(self) -> str:
         shell_name = Path(self._default_shell_path()).name
@@ -1051,7 +1347,7 @@ class AppServerWsRepl:
             "Execution routing: run terminal commands on the connected client machine, not the app-server host.\n"
             f"Client environment: os={os_name}, shell={shell_name}, cwd={cwd}, shell_mode={shell_mode}.\n"
             f"{init_hint}"
-            "Use exec_command and write_stdin for shell interactions."
+            "Use apply_patch for file edits, and exec_command/write_stdin for shell interactions."
         )
 
     def _default_shell_path(self) -> str:
@@ -1126,6 +1422,43 @@ class AppServerWsRepl:
             return cmd
 
         return f"uv run --project {shlex.quote(workdir)} {cmd}"
+
+    def _resolve_local_tool_workdir(self, workdir_value: Any) -> tuple[str, str | None]:
+        default_workdir_raw = self.cwd or os.getcwd()
+        default_path = Path(default_workdir_raw).expanduser()
+        if not default_path.is_dir():
+            default_path = Path.cwd()
+        default_workdir = str(default_path)
+
+        if not isinstance(workdir_value, str) or not workdir_value.strip():
+            return default_workdir, None
+
+        requested = workdir_value.strip()
+        candidate = Path(requested).expanduser()
+        if not candidate.is_absolute():
+            resolved = (default_path / candidate).resolve()
+            if resolved.is_dir():
+                return str(resolved), None
+            return (
+                default_workdir,
+                (
+                    f"Requested workdir '{requested}' is not accessible from this client cwd; "
+                    f"using '{default_workdir}'."
+                ),
+            )
+
+        if candidate.is_dir():
+            return str(candidate), None
+
+        return (
+            default_workdir,
+            f"Requested workdir '{requested}' is not accessible on this client; using '{default_workdir}'.",
+        )
+
+    def _resolve_apply_patch_path(self) -> str | None:
+        path = shutil.which("apply_patch")
+        self._local_apply_patch_path = path
+        return path
 
     def _shell_kind_for_path(self, shell_path: str) -> str:
         lower_name = Path(shell_path).name.lower()
@@ -1372,6 +1705,8 @@ class AppServerWsRepl:
             return await self._handle_dynamic_exec_command(arguments)
         if tool == "write_stdin":
             return await self._handle_dynamic_write_stdin(arguments)
+        if tool == "apply_patch":
+            return await self._handle_dynamic_apply_patch(arguments_raw)
         return self._dynamic_tool_failure(f"Unsupported dynamic tool: {tool}")
 
     def _dynamic_tool_failure(self, text: str) -> dict[str, Any]:
@@ -1400,12 +1735,7 @@ class AppServerWsRepl:
         if not isinstance(cmd, str) or not cmd.strip():
             return self._dynamic_tool_failure("exec_command requires a non-empty 'cmd' string.")
 
-        workdir_value = arguments.get("workdir")
-        workdir = (
-            str(workdir_value)
-            if isinstance(workdir_value, str) and workdir_value.strip()
-            else (self.cwd or os.getcwd())
-        )
+        workdir, workdir_note = self._resolve_local_tool_workdir(arguments.get("workdir"))
         cmd_to_run = self._rewrite_python_command_with_uv(cmd, workdir)
         shell = arguments.get("shell")
         shell_value = shell if isinstance(shell, str) and shell.strip() else None
@@ -1459,6 +1789,7 @@ class AppServerWsRepl:
                 tty_requested=tty_requested,
                 explicit_exit_code=exit_code,
                 started_at_override=command_started_at,
+                workdir_note=workdir_note,
             )
             return self._dynamic_tool_success(text)
 
@@ -1493,6 +1824,7 @@ class AppServerWsRepl:
             tty_requested=tty_requested,
             explicit_exit_code=None,
             started_at_override=None,
+            workdir_note=workdir_note,
         )
         return self._dynamic_tool_success(text)
 
@@ -1545,8 +1877,62 @@ class AppServerWsRepl:
             tty_requested=False,
             explicit_exit_code=exit_code,
             started_at_override=None,
+            workdir_note=None,
         )
         return self._dynamic_tool_success(text)
+
+    async def _handle_dynamic_apply_patch(self, arguments_raw: Any) -> dict[str, Any]:
+        patch: str | None = None
+        workdir_value: Any = None
+
+        if isinstance(arguments_raw, str):
+            patch = arguments_raw
+        elif isinstance(arguments_raw, dict):
+            raw_patch = arguments_raw.get("patch")
+            if isinstance(raw_patch, str):
+                patch = raw_patch
+            workdir_value = arguments_raw.get("workdir")
+
+        if patch is None:
+            return self._dynamic_tool_failure("apply_patch requires a 'patch' string.")
+        if not patch.strip():
+            return self._dynamic_tool_failure("apply_patch patch payload must not be empty.")
+
+        apply_patch_path = self._resolve_apply_patch_path()
+        if apply_patch_path is None:
+            return self._dynamic_tool_failure(
+                "apply_patch is not available on this client PATH. "
+                "This is not a read-only indicator; use exec_command for edits or install apply_patch."
+            )
+
+        effective_workdir, workdir_note = self._resolve_local_tool_workdir(workdir_value)
+        try:
+            process = await asyncio.create_subprocess_exec(
+                apply_patch_path,
+                cwd=effective_workdir,
+                env=self._local_tool_process_env(),
+                stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, stderr = await process.communicate(patch.encode("utf-8", errors="replace"))
+        except Exception as exc:
+            return self._dynamic_tool_failure(f"apply_patch failed to start: {exc}")
+
+        output = stdout.decode("utf-8", errors="replace")
+        err_text = stderr.decode("utf-8", errors="replace")
+        merged = output
+        if err_text:
+            merged = f"{merged}{err_text}"
+        if workdir_note:
+            merged = f"{workdir_note}\n{merged}"
+        merged = merged.strip() or "apply_patch finished without output."
+
+        if process.returncode != 0:
+            return self._dynamic_tool_failure(
+                f"apply_patch exited with code {process.returncode}\n{merged}"
+            )
+        return self._dynamic_tool_success(merged)
 
     def _register_local_session(
         self,
@@ -1643,6 +2029,7 @@ class AppServerWsRepl:
         tty_requested: bool,
         explicit_exit_code: int | None,
         started_at_override: float | None,
+        workdir_note: str | None,
     ) -> str:
         started_at = started_at_override or session.started_at
         wall_time_seconds = asyncio.get_running_loop().time() - started_at
@@ -1658,6 +2045,8 @@ class AppServerWsRepl:
                 sections.append(f"Process exited with code {exit_code}")
         if tty_requested:
             sections.append("TTY requested but not supported by this client; used pipes instead.")
+        if workdir_note:
+            sections.append(workdir_note)
         sections.append("Output:")
         sections.append(output)
         return "\n".join(sections)
@@ -1729,13 +2118,25 @@ Commands:
   :quit                     Exit
 
 Any line without ':' is sent as a new user turn (turn/start).
-Line editing: Arrow keys navigate history/cursor, Option+Left/Right jumps by word, Ctrl+X clears current input line.
+Line editing: prompt_toolkit UI (default) with robust paste; Ctrl+X clears current input line.
+Fallback raw-tty mode: Arrow keys navigate history/cursor, Option+Left/Right jumps by word, Ctrl+X clears current input line.
 """.strip()
     )
 
 
 async def run_repl(args: argparse.Namespace) -> int:
-    configure_readline()
+    prompt_session = None
+    use_prompt_toolkit = _should_use_prompt_toolkit(args.input_ui)
+    if use_prompt_toolkit:
+        prompt_session = _build_prompt_toolkit_session()
+        if prompt_session is None:
+            raise RuntimeError(
+                "prompt_toolkit ist nicht installiert. Installiere es mit: "
+                "`uv add --project python prompt-toolkit` "
+                "oder starte mit `--input-ui raw-tty`."
+            )
+    else:
+        configure_readline()
 
     repl = AppServerWsRepl(
         uri=args.url,
@@ -1752,6 +2153,13 @@ async def run_repl(args: argparse.Namespace) -> int:
         gateway_token=args.token,
         gateway_provider_id=args.provider_id,
         gateway_providers=load_gateway_providers(args.providers_json),
+        provider_preflight=args.provider_preflight,
+        provider_preflight_timeout_sec=args.provider_preflight_timeout_sec,
+        gateway_activity_indicator=args.gateway_activity_indicator,
+        thread_config_overrides=build_thread_config_overrides(
+            args.thread_config_json,
+            args.mcp_servers_json,
+        ),
     )
     await repl.connect()
     try:
@@ -1763,7 +2171,11 @@ async def run_repl(args: argparse.Namespace) -> int:
         print_help()
 
         while True:
-            line = await asyncio.to_thread(read_user_input, "> ")
+            if prompt_session is not None:
+                with patch_stdout(raw=True):
+                    line = await prompt_session.prompt_async("> ")
+            else:
+                line = await asyncio.to_thread(read_user_input, "> ")
             if not line.strip():
                 continue
 
@@ -1872,6 +2284,21 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="print full JSON params for notifications (debug)",
     )
     parser.add_argument(
+        "--input-ui",
+        choices=["auto", "prompt-toolkit", "raw-tty"],
+        default="prompt-toolkit",
+        help=(
+            "interactive input UI: prompt-toolkit (default), auto, or raw-tty; "
+            "prompt-toolkit gives robust copy/paste"
+        ),
+    )
+    parser.add_argument(
+        "--gateway-activity-indicator",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="show '*+' activity lines when JSON-RPC messages are sent/received",
+    )
+    parser.add_argument(
         "--local-tool-routing",
         action=argparse.BooleanOptionalAction,
         default=True,
@@ -1909,7 +2336,50 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             "use @/path/to/providers.json to read from file"
         ),
     )
+    parser.add_argument(
+        "--provider-preflight",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="check selected gateway provider reachability before thread/start",
+    )
+    parser.add_argument(
+        "--provider-preflight-timeout-sec",
+        type=float,
+        default=8.0,
+        help="timeout for provider preflight GET <baseUrl>/models",
+    )
+    parser.add_argument(
+        "--thread-config-json",
+        default=None,
+        help=(
+            "optional JSON object merged into thread/resume params.config; "
+            "use @/path/to/config.json to read from file"
+        ),
+    )
+    parser.add_argument(
+        "--mcp-servers-json",
+        default=None,
+        help=(
+            "optional JSON object of MCP server configs keyed by server name; "
+            "each entry is injected as config key mcp_servers.<name>; "
+            "use @/path/to/mcp_servers.json to read from file"
+        ),
+    )
     return parser.parse_args(argv)
+
+
+def build_thread_config_overrides(
+    thread_config_json: str | None,
+    mcp_servers_json: str | None,
+) -> dict[str, Any] | None:
+    merged: dict[str, Any] = {}
+    thread_overrides = load_thread_config_overrides(thread_config_json)
+    if thread_overrides:
+        merged.update(thread_overrides)
+    mcp_overrides = load_mcp_server_overrides(mcp_servers_json)
+    if mcp_overrides:
+        merged.update(mcp_overrides)
+    return merged or None
 
 
 def main(argv: list[str] | None = None) -> int:

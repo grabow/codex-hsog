@@ -19,7 +19,8 @@ WebSocket gateway for `codex app-server` with backend transport fixed to **stdio
 - Token-based authentication (`Bearer` header or `?token=...`)
 - Self-registration by token (default, no `users.json` required)
 - Per-user backend process with idle shutdown
-- `thread/start` rewrite to force a new workspace per session
+- `thread/start` prefers client-provided absolute `cwd` when valid
+  - falls back to a new gateway workspace when missing/invalid
 - Optional provider mapping from `initialize.params.xGateway.providers`
   - provider selection via `thread/start.params.xGateway.providerId`
 
@@ -118,6 +119,9 @@ The gateway accepts extra fields under `xGateway` (not forwarded as-is to backen
           "wireApi": "chat_completions",
           "fallbackChat": true,
           "fallbackChatPath": "/chat/completions",
+          "requestMaxRetries": 1,
+          "streamMaxRetries": 0,
+          "streamIdleTimeoutMs": 15000,
           "model": "gpt-4.1"
         }
       ]
@@ -139,7 +143,17 @@ The gateway accepts extra fields under `xGateway` (not forwarded as-is to backen
 }
 ```
 
-The gateway rewrites this into backend-compatible `modelProvider` + `config` overrides and forces `cwd` to a new workspace directory.
+The gateway rewrites this into backend-compatible `modelProvider` + `config` overrides.
+For `cwd`, gateway behavior is:
+
+- if client sends an absolute, existing directory in `thread/start.params.cwd`, it is used as-is
+- otherwise, gateway creates and uses a new per-session workspace directory
+
+Optional fail-fast fields in provider entries:
+
+- `requestMaxRetries` -> `model_providers.<id>.request_max_retries`
+- `streamMaxRetries` -> `model_providers.<id>.stream_max_retries`
+- `streamIdleTimeoutMs` -> `model_providers.<id>.stream_idle_timeout_ms`
 
 ## Notes
 
@@ -147,3 +161,5 @@ The gateway rewrites this into backend-compatible `modelProvider` + `config` ove
 - Backend transport remains stdio-only (`codex app-server --listen stdio://`).
 - Logging applies best-effort redaction for common secret fields/tokens.
 - Token management (rotation/revocation/audit) is still intentionally simple in this phase.
+- If a token is reused across live WebSocket clients, the gateway logs a `!!!` warning and includes `gatewayWarning` in the `initialize` result for the client.
+- For project-local skills, this means you can keep skills in `<project>/skills` and start the client in that project (or pass `--cwd`) so `skills/list` resolves the same context as local Codex.

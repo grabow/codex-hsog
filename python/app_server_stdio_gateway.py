@@ -24,6 +24,7 @@ import re
 import ssl
 import time
 from typing import Any
+from typing import Callable
 from urllib.parse import parse_qs, urlparse
 import uuid
 
@@ -184,6 +185,21 @@ def _normalize_provider_entry(raw: dict[str, Any]) -> tuple[str, dict[str, Any]]
         normalized["fallbackChat"] = bool(raw["fallbackChat"])
     if "fallbackChatPath" in raw:
         normalized["fallbackChatPath"] = raw["fallbackChatPath"]
+    if "requestMaxRetries" in raw:
+        value = raw["requestMaxRetries"]
+        if not isinstance(value, (int, float)):
+            raise ValueError(f"provider `{provider_id}` requestMaxRetries must be numeric")
+        normalized["requestMaxRetries"] = int(value)
+    if "streamMaxRetries" in raw:
+        value = raw["streamMaxRetries"]
+        if not isinstance(value, (int, float)):
+            raise ValueError(f"provider `{provider_id}` streamMaxRetries must be numeric")
+        normalized["streamMaxRetries"] = int(value)
+    if "streamIdleTimeoutMs" in raw:
+        value = raw["streamIdleTimeoutMs"]
+        if not isinstance(value, (int, float)):
+            raise ValueError(f"provider `{provider_id}` streamIdleTimeoutMs must be numeric")
+        normalized["streamIdleTimeoutMs"] = int(value)
 
     return provider_id, normalized
 
@@ -248,8 +264,83 @@ def _apply_provider_to_thread_start(
         config[f"{root}.fallback_chat"] = bool(provider["fallbackChat"])
     if "fallbackChatPath" in provider and provider["fallbackChatPath"] is not None:
         config[f"{root}.fallback_chat_path"] = provider["fallbackChatPath"]
+    if "requestMaxRetries" in provider:
+        config[f"{root}.request_max_retries"] = provider["requestMaxRetries"]
+    if "streamMaxRetries" in provider:
+        config[f"{root}.stream_max_retries"] = provider["streamMaxRetries"]
+    if "streamIdleTimeoutMs" in provider:
+        config[f"{root}.stream_idle_timeout_ms"] = provider["streamIdleTimeoutMs"]
 
     params["config"] = config
+
+
+def _resolve_thread_start_cwd(
+    *,
+    params: dict[str, Any],
+    user: UserConfig,
+    new_workspace: Callable[[], Path],
+) -> tuple[str, str]:
+    raw_cwd = params.get("cwd")
+    if isinstance(raw_cwd, str):
+        client_cwd = raw_cwd.strip()
+        if client_cwd:
+            candidate = Path(client_cwd)
+            if not candidate.is_absolute():
+                _LOG.warning(
+                    "thread/start rejected relative cwd user=%s cwd=%s; falling back to gateway workspace",
+                    user.user_id,
+                    client_cwd,
+                )
+            elif not candidate.is_dir():
+                _LOG.warning(
+                    "thread/start rejected missing/non-directory cwd user=%s cwd=%s; falling back to gateway workspace",
+                    user.user_id,
+                    client_cwd,
+                )
+            else:
+                return str(candidate), "client"
+    elif raw_cwd is not None:
+        _LOG.warning(
+            "thread/start rejected non-string cwd user=%s type=%s; falling back to gateway workspace",
+            user.user_id,
+            type(raw_cwd).__name__,
+        )
+
+    workspace = new_workspace()
+    _LOG.info(
+        "new session workspace user=%s path=%s",
+        user.user_id,
+        workspace,
+    )
+    return str(workspace), "workspace"
+
+
+def _sanitize_thread_config_for_backend(config: dict[str, Any]) -> bool:
+    """Normalize config keys that can crash current backend builds.
+
+    Workaround: `mcp_servers.<name>.required = true` currently triggers
+    a stack overflow in codex app-server for some builds. We downgrade it
+    to `false` and continue.
+    """
+    changed = False
+    for key, value in list(config.items()):
+        if not isinstance(key, str):
+            continue
+        if not key.startswith("mcp_servers."):
+            continue
+
+        if key.endswith(".required") and value is True:
+            config[key] = False
+            changed = True
+            continue
+
+        if isinstance(value, dict) and value.get("required") is True:
+            patched = dict(value)
+            patched["required"] = False
+            config[key] = patched
+            changed = True
+
+    return changed
 
 
 @dataclass
@@ -393,7 +484,10 @@ class UserWorker:
                     "clientInfo": {
                         "name": "codex_stdio_gateway",
                         "version": "0.1.0",
-                    }
+                    },
+                    "capabilities": {
+                        "experimentalApi": True,
+                    },
                 },
             }
         )
@@ -541,13 +635,22 @@ class UserWorker:
                 return
 
             client.initialize_done = True
+            initialize_result: dict[str, Any] = {
+                "userAgent": self.backend_user_agent,
+            }
+            active_connections = len(self.clients)
+            if active_connections > 1:
+                token_fingerprint = hashlib.sha256(client.user.token.encode("utf-8")).hexdigest()[:8]
+                initialize_result["gatewayWarning"] = (
+                    "!!! token is currently used by multiple live clients: "
+                    f"user={client.user.user_id} token={token_fingerprint} "
+                    f"activeConnections={active_connections}"
+                )
             await self._send_client(
                 client,
                 {
                     "id": request_id,
-                    "result": {
-                        "userAgent": self.backend_user_agent,
-                    },
+                    "result": initialize_result,
                 },
             )
             return
@@ -576,13 +679,18 @@ class UserWorker:
             outbound["params"] = params
 
         if method == "thread/start":
-            workspace = self._new_workspace()
-            params["cwd"] = str(workspace)
-            _LOG.info(
-                "new session workspace user=%s path=%s",
-                client.user.user_id,
-                workspace,
+            resolved_cwd, source = _resolve_thread_start_cwd(
+                params=params,
+                user=client.user,
+                new_workspace=self._new_workspace,
             )
+            params["cwd"] = resolved_cwd
+            if source == "client":
+                _LOG.info(
+                    "thread/start using client cwd user=%s cwd=%s",
+                    client.user.user_id,
+                    resolved_cwd,
+                )
             try:
                 _apply_provider_to_thread_start(params, client.providers)
             except KeyError as exc:
@@ -595,6 +703,15 @@ class UserWorker:
                     ),
                 )
                 return
+
+        if method in {"thread/start", "thread/resume"}:
+            config = params.get("config")
+            if isinstance(config, dict) and _sanitize_thread_config_for_backend(config):
+                _LOG.warning(
+                    "thread config adjusted for backend stability user=%s: "
+                    "forcing mcp_servers.*.required=false to avoid backend stack overflow",
+                    client.user.user_id,
+                )
 
         if "id" not in outbound:
             await self._send_backend_message(outbound)
@@ -630,11 +747,21 @@ class GatewayServer:
         self.workspace_root = workspace_root
         self.allow_self_register = allow_self_register
 
-        self.users_by_token = {user.token: user for user in users}
-        self.workers_by_user = {
-            user.user_id: UserWorker(user, codex_bin, idle_timeout_seconds)
-            for user in users
-        }
+        self.users_by_token: dict[str, UserConfig] = {}
+        self.workers_by_user: dict[str, UserWorker] = {}
+        for user in users:
+            previous = self.users_by_token.get(user.token)
+            if previous is not None and previous.user_id != user.user_id:
+                token_fingerprint = hashlib.sha256(user.token.encode("utf-8")).hexdigest()[:8]
+                _LOG.warning(
+                    "!!! duplicate token configured: users=%s and %s share token=%s (last entry wins)",
+                    previous.user_id,
+                    user.user_id,
+                    token_fingerprint,
+                )
+            self.users_by_token[user.token] = user
+            if user.user_id not in self.workers_by_user:
+                self.workers_by_user[user.user_id] = UserWorker(user, codex_bin, idle_timeout_seconds)
         self._reaper_task: asyncio.Task[None] | None = None
 
     @staticmethod
@@ -648,6 +775,15 @@ class GatewayServer:
 
         existing = self.users_by_token.get(token)
         if existing is not None:
+            worker = self.workers_by_user.get(existing.user_id)
+            if worker is not None and worker.clients:
+                token_fingerprint = hashlib.sha256(token.encode("utf-8")).hexdigest()[:8]
+                _LOG.warning(
+                    "!!! token reused across active connections: user=%s token=%s active_connections=%s",
+                    existing.user_id,
+                    token_fingerprint,
+                    len(worker.clients) + 1,
+                )
             return existing
         if not self.allow_self_register:
             return None
@@ -730,6 +866,14 @@ class GatewayServer:
             return
 
         _LOG.info("connection accepted user=%s", user.user_id)
+        if len(worker.clients) > 1:
+            token_fingerprint = hashlib.sha256(user.token.encode("utf-8")).hexdigest()[:8]
+            _LOG.warning(
+                "!!! token shared by multiple live clients: user=%s token=%s active_connections=%s",
+                user.user_id,
+                token_fingerprint,
+                len(worker.clients),
+            )
 
         try:
             async for raw_message in websocket:
@@ -772,7 +916,8 @@ class GatewayServer:
                     continue
 
                 if "id" in message and ("result" in message or "error" in message):
-                    # Client response messages are not expected in this gateway mode.
+                    # Forward client responses (e.g. tool-call results) back to backend.
+                    await worker._send_backend_message(message)
                     continue
 
                 await worker._send_client(
