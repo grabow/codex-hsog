@@ -312,6 +312,8 @@ jobs:
           cp "target/${target}/release/codex" "${bundle_dir}/codex-hsog"
           cp "${GITHUB_WORKSPACE}/.github/release-assets/start-codex-hsog.sh" "${bundle_dir}/start-codex-hsog.sh"
           cp "${GITHUB_WORKSPACE}/.github/release-assets/README-posix.txt" "${bundle_dir}/README.txt"
+          cp "${GITHUB_WORKSPACE}/LICENSE" "${bundle_dir}/LICENSE"
+          cp "${GITHUB_WORKSPACE}/NOTICE" "${bundle_dir}/NOTICE"
 
           chmod +x "${bundle_dir}/codex-hsog" "${bundle_dir}/start-codex-hsog.sh"
 

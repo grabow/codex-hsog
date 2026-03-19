@@ -155,6 +155,8 @@ jobs:
           cp "$dest/codex-windows-sandbox-setup-${{ matrix.target }}.exe" "$bundle_dir/codex-windows-sandbox-setup.exe"
           cp "${GITHUB_WORKSPACE}/.github/release-assets/start-codex-hsog.ps1" "$bundle_dir/start-codex-hsog.ps1"
           cp "${GITHUB_WORKSPACE}/.github/release-assets/README-windows.txt" "$bundle_dir/README.txt"
+          cp "${GITHUB_WORKSPACE}/LICENSE" "$bundle_dir/LICENSE"
+          cp "${GITHUB_WORKSPACE}/NOTICE" "$bundle_dir/NOTICE"
 
           (cd "$bundle_dir" && 7z a "$repo_root/$dest/${bundle_base}.zip" .)
           rm -rf "$bundle_dir"
