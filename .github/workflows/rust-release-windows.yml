@@ -44,13 +44,6 @@ jobs:
             runs_on:
               group: codex-runners
               labels: codex-windows-x64
-          - runner: windows-arm64
-            target: aarch64-pc-windows-msvc
-            bundle: primary
-            build_args: --bin codex --bin codex-responses-api-proxy
-            runs_on:
-              group: codex-runners
-              labels: codex-windows-arm64
           - runner: windows-x64
             target: x86_64-pc-windows-msvc
             bundle: helpers
@@ -58,13 +51,6 @@ jobs:
             runs_on:
               group: codex-runners
               labels: codex-windows-x64
-          - runner: windows-arm64
-            target: aarch64-pc-windows-msvc
-            bundle: helpers
-            build_args: --bin codex-windows-sandbox-setup --bin codex-command-runner
-            runs_on:
-              group: codex-runners
-              labels: codex-windows-arm64
 
     steps:
       - uses: actions/checkout@v6
@@ -140,11 +126,6 @@ jobs:
             runs_on:
               group: codex-runners
               labels: codex-windows-x64
-          - runner: windows-arm64
-            target: aarch64-pc-windows-msvc
-            runs_on:
-              group: codex-runners
-              labels: codex-windows-arm64
 
     steps:
       - uses: actions/checkout@v6

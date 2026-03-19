@@ -14,8 +14,12 @@ use std::path::PathBuf;
 
 use crate::version::CODEX_CLI_VERSION;
 
+// This fork is distributed via its own native release channel, so the built-in
+// OpenAI updater must remain disabled.
+const UPDATE_CHECKS_ENABLED: bool = false;
+
 pub fn get_upgrade_version(config: &Config) -> Option<String> {
-    if !config.check_for_update_on_startup {
+    if !UPDATE_CHECKS_ENABLED || !config.check_for_update_on_startup {
         return None;
     }
 
@@ -137,7 +141,7 @@ fn extract_version_from_latest_tag(latest_tag_name: &str) -> anyhow::Result<Stri
 /// Returns the latest version to show in a popup, if it should be shown.
 /// This respects the user's dismissal choice for the current latest version.
 pub fn get_upgrade_version_for_popup(config: &Config) -> Option<String> {
-    if !config.check_for_update_on_startup {
+    if !UPDATE_CHECKS_ENABLED || !config.check_for_update_on_startup {
         return None;
     }
 
