@@ -352,16 +352,6 @@ jobs:
     with:
       release-lto: ${{ contains(github.ref_name, '-alpha') && 'thin' || 'fat' }}
 
-  shell-tool-mcp:
-    if: ${{ github.repository == 'openai/codex' }}
-    name: shell-tool-mcp
-    needs: tag-check
-    uses: ./.github/workflows/shell-tool-mcp.yml
-    with:
-      release-tag: ${{ github.ref_name }}
-      publish: true
-    secrets: inherit
-
   release:
     needs:
       - build
