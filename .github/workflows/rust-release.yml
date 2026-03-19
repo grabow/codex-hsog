@@ -214,48 +214,6 @@ jobs:
           path: codex-rs/target/**/cargo-timings/cargo-timing.html
           if-no-files-found: warn
 
-      - if: ${{ runner.os == 'macOS' }}
-        name: Build macOS dmg
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          target="${{ matrix.target }}"
-          release_dir="target/${target}/release"
-          dmg_root="${RUNNER_TEMP}/codex-hsog-dmg-root"
-          volname="Codex HSOG (${target})"
-          dmg_path="${release_dir}/codex-hsog-${target}.dmg"
-          codex_binary_path="${release_dir}/codex"
-          proxy_binary_path="${release_dir}/codex-responses-api-proxy"
-
-          rm -rf "$dmg_root"
-          mkdir -p "$dmg_root"
-
-          if [[ ! -f "$codex_binary_path" ]]; then
-            echo "Binary $codex_binary_path not found"
-            exit 1
-          fi
-          if [[ ! -f "$proxy_binary_path" ]]; then
-            echo "Binary $proxy_binary_path not found"
-            exit 1
-          fi
-
-          ditto "$codex_binary_path" "${dmg_root}/codex-hsog"
-          ditto "$proxy_binary_path" "${dmg_root}/codex-responses-api-proxy"
-
-          rm -f "$dmg_path"
-          hdiutil create \
-            -volname "$volname" \
-            -srcfolder "$dmg_root" \
-            -format UDZO \
-            -ov \
-            "$dmg_path"
-
-          if [[ ! -f "$dmg_path" ]]; then
-            echo "dmg $dmg_path not found after build"
-            exit 1
-          fi
-
       - name: Stage artifacts
         shell: bash
         run: |
@@ -265,10 +223,6 @@ jobs:
 
           cp target/${{ matrix.target }}/release/codex "$dest/codex-hsog-${{ matrix.target }}"
           cp target/${{ matrix.target }}/release/codex-responses-api-proxy "$dest/codex-responses-api-proxy-${{ matrix.target }}"
-
-          if [[ "${{ matrix.target }}" == *apple-darwin ]]; then
-            cp target/${{ matrix.target }}/release/codex-hsog-${{ matrix.target }}.dmg "$dest/codex-hsog-${{ matrix.target }}.dmg"
-          fi
 
       - name: Build student bundle
         shell: bash
