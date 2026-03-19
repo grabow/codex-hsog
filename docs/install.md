@@ -8,11 +8,11 @@
 | Git (optional, recommended) | 2.23+ for built-in PR helpers                                   |
 | RAM                         | 4-GB minimum (8-GB recommended)                                 |
 
-Fork note: this distribution currently publishes native Windows builds for `x86_64` only. On Windows ARM64, use the `x86_64` build under Windows emulation until a native ARM64 release is added.
+Fork note: this distribution is published as `codex-hsog` so it can coexist with an existing upstream `codex` installation. It currently publishes native Windows builds for `x86_64` only. On Windows ARM64, use the `x86_64` build under Windows emulation until a native ARM64 release is added.
 
 ### DotSlash
 
-The GitHub Release also contains a [DotSlash](https://dotslash-cli.com/) file for the Codex CLI named `codex`. Using a DotSlash file makes it possible to make a lightweight commit to source control to ensure all contributors use the same version of an executable, regardless of what platform they use for development.
+The GitHub Release also contains a [DotSlash](https://dotslash-cli.com/) file for the Codex CLI named `codex-hsog`. Using a DotSlash file makes it possible to make a lightweight commit to source control to ensure all contributors use the same version of an executable, regardless of what platform they use for development.
 
 ### Build from source
 
@@ -34,7 +34,8 @@ cargo install cargo-nextest
 # Build Codex.
 cargo build
 
-# Launch the TUI with a sample prompt.
+# Launch the TUI with a sample prompt. The workspace bin name remains `codex`,
+# while release artifacts for students are renamed to `codex-hsog`.
 cargo run --bin codex -- "explain this codebase to me"
 
 # After making changes, use the root justfile helpers (they default to codex-rs):
