@@ -165,6 +165,7 @@ jobs:
       - name: Stage artifacts
         shell: bash
         run: |
+          set -euo pipefail
           dest="dist/${{ matrix.target }}"
           mkdir -p "$dest"
 
@@ -173,68 +174,48 @@ jobs:
           cp target/${{ matrix.target }}/release/codex-windows-sandbox-setup.exe "$dest/codex-windows-sandbox-setup-${{ matrix.target }}.exe"
           cp target/${{ matrix.target }}/release/codex-command-runner.exe "$dest/codex-command-runner-${{ matrix.target }}.exe"
 
+      - name: Build student bundle
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          dest="dist/${{ matrix.target }}"
+          repo_root=$PWD
+          bundle_base="codex-hsog-windows-x86_64"
+          bundle_dir="$(mktemp -d)"
+
+          cp "$dest/codex-hsog-${{ matrix.target }}.exe" "$bundle_dir/codex-hsog.exe"
+          cp "$dest/codex-command-runner-${{ matrix.target }}.exe" "$bundle_dir/codex-command-runner.exe"
+          cp "$dest/codex-windows-sandbox-setup-${{ matrix.target }}.exe" "$bundle_dir/codex-windows-sandbox-setup.exe"
+          cp "${GITHUB_WORKSPACE}/.github/release-assets/start-codex-hsog.ps1" "$bundle_dir/start-codex-hsog.ps1"
+          cp "${GITHUB_WORKSPACE}/.github/release-assets/README-windows.txt" "$bundle_dir/README.txt"
+
+          (cd "$bundle_dir" && 7z a "$repo_root/$dest/${bundle_base}.zip" .)
+          rm -rf "$bundle_dir"
+
       - name: Install DotSlash
         uses: facebook/install-dotslash@v2
 
       - name: Compress artifacts
         shell: bash
         run: |
+          set -euo pipefail
           # Path that contains the uncompressed binaries for the current
           # ${{ matrix.target }}
           dest="dist/${{ matrix.target }}"
-          repo_root=$PWD
 
-          # For compatibility with environments that lack the `zstd` tool we
-          # additionally create a `.tar.gz` and `.zip` for every Windows binary.
-          # The end result is:
-          #   codex-hsog-<target>.zst
-          #   codex-hsog-<target>.tar.gz
-          #   codex-hsog-<target>.zip
+          # Keep raw Windows executables plus .zst assets for DotSlash and
+          # advanced/manual installs. Student-facing bundles are packaged above.
           for f in "$dest"/*; do
             base="$(basename "$f")"
-            # Skip files that are already archives (shouldn't happen, but be
-            # safe).
             if [[ "$base" == *.tar.gz || "$base" == *.zip || "$base" == *.dmg ]]; then
               continue
             fi
 
-            # Don't try to compress signature bundles.
             if [[ "$base" == *.sigstore ]]; then
               continue
             fi
 
-            # Create per-binary tar.gz
-            tar -C "$dest" -czf "$dest/${base}.tar.gz" "$base"
-
-            # Create zip archive for Windows binaries.
-            # Must run from inside the dest dir so 7z won't embed the
-            # directory path inside the zip.
-            if [[ "$base" == "codex-hsog-${{ matrix.target }}.exe" ]]; then
-              # Bundle the sandbox helper binaries into the main codex-hsog zip
-              # so installs include the required helpers next to codex-hsog.exe.
-              # Fall back to the single-binary zip if the helpers are missing
-              # to avoid breaking releases.
-              bundle_dir="$(mktemp -d)"
-              runner_src="$dest/codex-command-runner-${{ matrix.target }}.exe"
-              setup_src="$dest/codex-windows-sandbox-setup-${{ matrix.target }}.exe"
-              if [[ -f "$runner_src" && -f "$setup_src" ]]; then
-                cp "$dest/$base" "$bundle_dir/$base"
-                cp "$runner_src" "$bundle_dir/codex-command-runner.exe"
-                cp "$setup_src" "$bundle_dir/codex-windows-sandbox-setup.exe"
-                # Use an absolute path so bundle zips land in the real dist
-                # dir even when 7z runs from a temp directory.
-                (cd "$bundle_dir" && 7z a "$repo_root/$dest/${base}.zip" .)
-              else
-                echo "warning: missing sandbox binaries; falling back to single-binary zip"
-                echo "warning: expected $runner_src and $setup_src"
-                (cd "$dest" && 7z a "${base}.zip" "$base")
-              fi
-              rm -rf "$bundle_dir"
-            else
-              (cd "$dest" && 7z a "${base}.zip" "$base")
-            fi
-
-            # Keep raw executables and produce .zst alongside them.
             "${GITHUB_WORKSPACE}/.github/workflows/zstd" -T0 -19 "$dest/$base"
           done
 

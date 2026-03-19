@@ -4,11 +4,13 @@
 
 | Requirement                 | Details                                                         |
 | --------------------------- | --------------------------------------------------------------- |
-| Operating systems           | macOS 12+, Ubuntu 20.04+/Debian 10+, or Windows 11 **via WSL2** |
+| Operating systems           | macOS 12+, Ubuntu 20.04+/Debian 10+, or Windows 11 x64          |
 | Git (optional, recommended) | 2.23+ for built-in PR helpers                                   |
 | RAM                         | 4-GB minimum (8-GB recommended)                                 |
 
 Fork note: this distribution is published as `codex-hsog` so it can coexist with an existing upstream `codex` installation. It currently publishes native Windows builds for `x86_64` only. On Windows ARM64, use the `x86_64` build under Windows emulation until a native ARM64 release is added.
+
+Student releases additionally ship one archive per platform that already contains the `codex-hsog` binary, a platform-specific launcher, and a short `README.txt`. The launcher prompts for `HSOG_API_KEY` and injects the HSOG model-provider config on the command line, so students do not need to edit `~/.codex/config.toml` for first use.
 
 ### DotSlash
 
